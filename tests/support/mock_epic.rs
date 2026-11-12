@@ -42,6 +42,9 @@ struct Pending {
     redirect_uri: String,
     patient: String,
     fhir_user: String,
+    /// The authorization's `nonce`, which Epic's ID token carries "only if it
+    /// was specified in the authorization request".
+    nonce: Option<String>,
 }
 
 struct Issued {
@@ -55,6 +58,8 @@ pub struct State {
     pub pick: Pick,
     /// `expires_in` for tokens from the JWT-bearer grant.
     pub token_lifetime: i64,
+    /// Token answers leave out `expires_in` (the tokens still last an hour).
+    pub omit_expires_in: bool,
     pub offer_registration: bool,
     pub refuse_jwt_bearer: bool,
     codes: HashMap<String, Pending>,
@@ -63,6 +68,11 @@ pub struct State {
     clients: HashMap<String, (String, String, Value)>,
     pub jwt_bearer_grants: usize,
     pub registrations: usize,
+    /// Authorizations that carried a `nonce`.
+    pub nonces: usize,
+    /// The ID token carries another nonce than the authorization's, as an
+    /// answer to some other sign-in would.
+    pub wrong_nonce: bool,
     /// resourceType → resources, parsed and as the text served (decimals
     /// such as `13.50` kept).
     pub resources: HashMap<String, Vec<(Value, String)>>,
@@ -98,9 +108,22 @@ pub struct Fault {
     pub status: u16,
     pub body: String,
     pub times: usize,
+    /// Only the search page starting here (`start=`), when set.
+    pub start: Option<usize>,
 }
 
 impl Fault {
+    /// One `status` for the page of `path`'s search that starts at `start`.
+    pub fn on_page(path: &str, start: usize, status: u16) -> Self {
+        Fault {
+            path: path.into(),
+            status,
+            body: "<html><body>Refused</body></html>".into(),
+            times: 1,
+            start: Some(start),
+        }
+    }
+
     /// `times` HTTP 500s for `path`, each saying to retry at once.
     pub fn failing(path: &str, times: usize) -> Self {
         Fault {
@@ -108,6 +131,7 @@ impl Fault {
             status: 500,
             body: "<html><body>Internal error</body></html>".into(),
             times,
+            start: None,
         }
     }
 
@@ -118,6 +142,7 @@ impl Fault {
             status: 200,
             body: "<html><body>Down for maintenance</body></html>".into(),
             times: usize::MAX,
+            start: None,
         }
     }
 }
@@ -138,6 +163,7 @@ impl MockEpic {
         let state = Arc::new(Mutex::new(State {
             pick: Pick::Myself,
             token_lifetime: 3600,
+            omit_expires_in: false,
             offer_registration: true,
             refuse_jwt_bearer: false,
             codes: HashMap::new(),
@@ -145,6 +171,8 @@ impl MockEpic {
             clients: HashMap::new(),
             jwt_bearer_grants: 0,
             registrations: 0,
+            nonces: 0,
+            wrong_nonce: false,
             resources: synthetic_resources(),
             refuse: vec![
                 ("Observation?category=sdoh".into(), 400),
@@ -401,6 +429,7 @@ fn serve(mut stream: TcpStream, port: u16, state: &Arc<Mutex<State>>) -> Option<
                 Pick::Myself => (SELF_PATIENT.to_string(), format!("Patient/{SELF_PATIENT}")),
                 Pick::Child => (CHILD_PATIENT.to_string(), PROXY_USER.to_string()),
             };
+            st.nonces += usize::from(q.contains_key("nonce"));
             let code = st.next("code");
             st.codes.insert(
                 code.clone(),
@@ -409,6 +438,7 @@ fn serve(mut stream: TcpStream, port: u16, state: &Arc<Mutex<State>>) -> Option<
                     redirect_uri: redirect.clone(),
                     patient,
                     fhir_user,
+                    nonce: q.get("nonce").cloned(),
                 },
             );
             drop(st);
@@ -527,8 +557,16 @@ fn token(
             // Keep the code's fhirUser for the registration that follows.
             let fhir_user = pending.fhir_user.clone();
             let patient = pending.patient.clone();
+            let nonce = pending.nonce.clone().map(|n| {
+                if st.wrong_nonce {
+                    format!("{n}-other")
+                } else {
+                    n
+                }
+            });
             let used = format!("used-{}", st.counter);
             st.codes.insert(used, pending);
+            let omit_expires_in = st.omit_expires_in;
             let token = st.next("initial");
             st.tokens.insert(
                 token.clone(),
@@ -542,21 +580,27 @@ fn token(
             let id_token = format!(
                 "{}.{}.sig",
                 B64.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
-                B64.encode(json!({ "sub": fhir_user, "fhirUser": format!("{origin}/api/FHIR/R4/{fhir_user}"), "exp": now() + 300 }).to_string())
+                B64.encode({
+                    let mut claims = json!({ "sub": fhir_user, "fhirUser": format!("{origin}/api/FHIR/R4/{fhir_user}"), "exp": now() + 300 });
+                    if let Some(nonce) = nonce {
+                        claims["nonce"] = nonce.into();
+                    }
+                    claims.to_string()
+                })
             );
-            json_resp(
-                stream,
-                200,
-                &json!({
-                    "access_token": token,
-                    "token_type": "Bearer",
-                    "expires_in": 3600,
-                    "scope": "openid fhirUser launch/patient offline_access patient/Patient.read",
-                    "id_token": id_token,
-                    "patient": patient,
-                    "__epic.dstu2.patient": "dstu2-dummy",
-                }),
-            );
+            let mut answer = json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "openid fhirUser launch/patient offline_access patient/Patient.read",
+                "id_token": id_token,
+                "patient": patient,
+                "__epic.dstu2.patient": "dstu2-dummy",
+            });
+            if omit_expires_in {
+                answer.as_object_mut().unwrap().remove("expires_in");
+            }
+            json_resp(stream, 200, &answer);
         }
         "urn:ietf:params:oauth:grant-type:jwt-bearer" => {
             let client = get("client_id");
@@ -579,6 +623,7 @@ fn token(
             }
             st.jwt_bearer_grants += 1;
             let lifetime = st.token_lifetime;
+            let omit_expires_in = st.omit_expires_in;
             let token = st.next("access");
             st.tokens.insert(
                 token.clone(),
@@ -589,17 +634,17 @@ fn token(
                 },
             );
             drop(st);
-            json_resp(
-                stream,
-                200,
-                &json!({
-                    "access_token": token,
-                    "token_type": "Bearer",
-                    "expires_in": lifetime,
-                    "scope": "launch/patient offline_access patient/Patient.read",
-                    "patient": patient,
-                }),
-            );
+            let mut answer = json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": lifetime,
+                "scope": "launch/patient offline_access patient/Patient.read",
+                "patient": patient,
+            });
+            if omit_expires_in {
+                answer.as_object_mut().unwrap().remove("expires_in");
+            }
+            json_resp(stream, 200, &answer);
         }
         _ => {
             drop(st);
@@ -676,7 +721,12 @@ fn fhir(
     let rest = req.path.trim_start_matches("/api/FHIR/R4/");
     let mut st = st;
     *st.hits.entry(rest.to_string()).or_insert(0) += 1;
-    if let Some(f) = st.faults.iter_mut().find(|f| f.path == rest && f.times > 0) {
+    let start = q.get("start").and_then(|s| s.parse().ok());
+    if let Some(f) = st
+        .faults
+        .iter_mut()
+        .find(|f| f.path == rest && f.times > 0 && f.start.is_none_or(|s| Some(s) == start))
+    {
         f.times -= 1;
         let (status, body) = (f.status, f.body.clone());
         drop(st);

@@ -4,15 +4,14 @@
 //! The binary is `src/main.rs`; this library holds everything it runs, so
 //! the tests reach it without a network or a Keychain.
 
+pub mod browser;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod epic;
 pub mod export;
 pub mod fhir;
 pub mod fsutil;
-pub mod key;
-pub mod oauth;
 pub mod orgs;
 pub mod session;
-pub mod smart;
 pub mod vault;

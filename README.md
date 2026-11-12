@@ -79,6 +79,7 @@ Release assets: `mychart-<target>.tar.gz` and `.sha256` for
 | `auth status` / `auth logout` | Each sign-in's state (`auth-status/v1`); remove one or all |
 | `patients list [--status]` | The patients signed in, each with `self` or `proxy` (`patient-list/v1`) |
 | `records export --patient <ID> [--since D] --ndjson` | Every resource the organization serves, documents included, as `records-stream/v1` |
+| `records export --patient <ID> -o <DIR>` | The same stream into `<DIR>/records.ndjson`, for Epic's sandbox and test servers only (`records-export/v1`); one cut short goes to `records.incomplete.ndjson` |
 | `documents list\|download` | Notes, reports and scans (`documents/v1`) |
 | `api GET <path>` | One FHIR read as the signed-in patient |
 | `config path\|show\|set\|unset` | Client ids, redirect port, scope, directory URL |

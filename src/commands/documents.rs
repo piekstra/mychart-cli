@@ -17,7 +17,6 @@ use serde_json::Value;
 use super::{transport, Ctx};
 use crate::cli::{DocumentsCmd, PatientArgs};
 use crate::fhir::{Failure, Fhir};
-use crate::session::Live;
 
 pub fn run(ctx: &Ctx, cmd: &DocumentsCmd) -> Result<(), CliError> {
     match cmd {
@@ -156,16 +155,15 @@ pub fn list(
 ) -> Result<Vec<Listed>, CliError> {
     let c = ctx.signed_in(who)?;
     let t = transport()?;
-    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let tell = |line: String| ctx.note(line);
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let live = ctx.live(&t, &c)?;
+    let fhir = Fhir::new(&t, &live)?;
     list_in(ctx, &fhir, &c.id, range)
 }
 
 /// The patient's documents in `range`, newest first, through one sign-in.
-fn list_in<T: pk_cli_core::transport::Transport>(
+fn list_in<T: crate::fhir::Wire>(
     ctx: &Ctx,
-    fhir: &Fhir<'_, T>,
+    fhir: &Fhir<T>,
     patient: &str,
     range: &pk_cli_documents::RangeArgs,
 ) -> Result<Vec<Listed>, CliError> {
@@ -174,7 +172,7 @@ fn list_in<T: pk_cli_core::transport::Transport>(
     for extra in [&[("category", "clinical-note")][..], &[][..]] {
         let mut params = vec![("patient".to_string(), patient.to_string())];
         params.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        let r = fhir.search_each("DocumentReference", &params, |r| {
+        let (summary, r) = fhir.search_each("DocumentReference", &params, |r| {
             if seen.insert(r.id.clone()) {
                 if let Ok(v) = r.value() {
                     out.extend(documents_of(&v));
@@ -182,12 +180,14 @@ fn list_in<T: pk_cli_core::transport::Transport>(
             }
             Ok(())
         });
-        match r {
-            Ok(summary) if summary.malformed > 0 => ctx.note(format!(
+        if summary.malformed > 0 {
+            ctx.note(format!(
                 "warning: {} DocumentReference entries were not FHIR resources",
                 summary.malformed
-            )),
-            Ok(_) => {}
+            ));
+        }
+        match r {
+            Ok(()) => {}
             Err(Failure::Skip { code, reason }) => ctx.note(format!(
                 "warning: DocumentReference search {extra:?} refused ({code}: {reason})"
             )),
@@ -208,10 +208,7 @@ fn list_in<T: pk_cli_core::transport::Transport>(
 }
 
 /// Fetch one document's bytes and check they are what its type says.
-fn fetch<T: pk_cli_core::transport::Transport>(
-    fhir: &Fhir<'_, T>,
-    d: &Listed,
-) -> Result<Vec<u8>, Failure> {
+fn fetch<T: crate::fhir::Wire>(fhir: &Fhir<T>, d: &Listed) -> Result<Vec<u8>, Failure> {
     let b = fhir.binary(&d.url)?;
     let v = b.value().unwrap_or_default();
     let Some(data) = v["data"].as_str() else {
@@ -252,9 +249,8 @@ fn download_one(ctx: &Ctx, who: &PatientArgs, id: &str, output: &Path) -> Result
     let id = id.strip_suffix("#1").unwrap_or(id);
     let c = ctx.signed_in(who)?;
     let t = transport()?;
-    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let tell = |line: String| ctx.note(line);
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let live = ctx.live(&t, &c)?;
+    let fhir = Fhir::new(&t, &live)?;
     let docs = list_in(ctx, &fhir, &c.id, &pk_cli_documents::RangeArgs::default())?;
     let Some(d) = docs.iter().find(|d| d.document.id == id) else {
         return Err(
@@ -285,9 +281,8 @@ fn download_all(
     }
     let c = ctx.signed_in(who)?;
     let t = transport()?;
-    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let tell = |line: String| ctx.note(line);
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let live = ctx.live(&t, &c)?;
+    let fhir = Fhir::new(&t, &live)?;
     let docs = list_in(ctx, &fhir, &c.id, range)?;
     crate::fsutil::create_private_dir(dir)?;
     let (mut saved, mut skipped) = (Vec::new(), Vec::new());
