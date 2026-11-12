@@ -42,6 +42,9 @@ Medical records are the most sensitive data a household has.
 - `records export -o <DIR>` writes a plain file and refuses any organization
   but the sandbox and 127.0.0.1; real records go into medrec's encrypted
   vault through `--ndjson`.
+- No MCP surface: mychart is not registered in cli-mcp and ships no `mcp`
+  command, because a tool call would hand records to the model making it
+  (the effort's plan, §8, until the owner decides otherwise).
 
 ## Credentials
 
