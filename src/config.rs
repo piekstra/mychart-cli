@@ -9,14 +9,9 @@ use serde::{Deserialize, Serialize};
 
 /// The loopback port the sign-in's redirect comes back to. Epic matches the
 /// registered redirect URI, so the port is fixed (and configurable) rather
-/// than picked at random per sign-in.
+/// than picked at random per sign-in. The redirect URI is
+/// `http://127.0.0.1:<port>/callback` (RFC 8252 §7.3, `pk_cli_auth`).
 pub const DEFAULT_REDIRECT_PORT: u16 = 7468;
-pub const REDIRECT_PATH: &str = "/callback";
-
-/// The host the redirect URI names: `127.0.0.1` (RFC 8252's advice) or
-/// `localhost`, whichever the app's registration lists. The listener binds
-/// 127.0.0.1 either way.
-pub const DEFAULT_REDIRECT_HOST: &str = "127.0.0.1";
 
 /// The scopes a sign-in asks for, as Epic's tutorial gives them for a
 /// standalone launch: Epic adds the resource scopes of the APIs the app was
@@ -25,8 +20,8 @@ pub const DEFAULT_REDIRECT_HOST: &str = "127.0.0.1";
 /// the hour.
 pub const DEFAULT_SCOPE: &str = "openid fhirUser";
 
-pub const KEYS: &str = "client_id, sandbox_client_id, redirect_port, redirect_host, scope, \
-                        directory_url, dynamic_registration";
+pub const KEYS: &str =
+    "client_id, sandbox_client_id, redirect_port, scope, directory_url, dynamic_registration";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -38,8 +33,6 @@ pub struct Config {
     pub sandbox_client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub redirect_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     /// Where `orgs refresh` downloads Epic's directory from.
@@ -54,16 +47,6 @@ pub struct Config {
 impl Config {
     pub fn redirect_port(&self) -> u16 {
         self.redirect_port.unwrap_or(DEFAULT_REDIRECT_PORT)
-    }
-
-    /// `http://<host>:<port>/callback`, the URI the app's registration lists.
-    pub fn redirect_uri(&self, port: u16) -> String {
-        format!(
-            "http://{}:{port}{REDIRECT_PATH}",
-            self.redirect_host
-                .as_deref()
-                .unwrap_or(DEFAULT_REDIRECT_HOST)
-        )
     }
 
     pub fn scope(&self) -> &str {
@@ -84,14 +67,6 @@ impl Config {
                 })?;
                 self.redirect_port = Some(port);
             }
-            "redirect_host" => match value {
-                "127.0.0.1" | "localhost" => self.redirect_host = Some(value.to_string()),
-                _ => {
-                    return Err(CliError::Usage(
-                        "redirect_host is 127.0.0.1 or localhost".into(),
-                    ))
-                }
-            },
             "scope" => self.scope = Some(value.trim().to_string()),
             "directory_url" => {
                 pk_cli_core::transport::require_secure_url(value)?;
@@ -114,7 +89,6 @@ impl Config {
             "client_id" => self.client_id = None,
             "sandbox_client_id" => self.sandbox_client_id = None,
             "redirect_port" => self.redirect_port = None,
-            "redirect_host" => self.redirect_host = None,
             "scope" => self.scope = None,
             "directory_url" => self.directory_url = None,
             "dynamic_registration" => self.dynamic_registration = None,
@@ -162,10 +136,11 @@ mod tests {
         c.set("directory_url", "http://127.0.0.1:9/brands").unwrap();
         c.set("dynamic_registration", "false").unwrap();
         assert!(!c.dynamic_registration());
-        assert_eq!(c.redirect_uri(8123), "http://127.0.0.1:8123/callback");
-        c.set("redirect_host", "localhost").unwrap();
-        assert_eq!(c.redirect_uri(8123), "http://localhost:8123/callback");
-        assert!(c.set("redirect_host", "example.com").is_err());
+        // The redirect host is always 127.0.0.1: no setting names it.
+        assert_eq!(
+            c.set("redirect_host", "localhost").unwrap_err().exit_code(),
+            2
+        );
         c.unset("redirect_port").unwrap();
         assert_eq!(c.redirect_port(), DEFAULT_REDIRECT_PORT);
         assert_eq!(c.set("nope", "x").unwrap_err().exit_code(), 2);

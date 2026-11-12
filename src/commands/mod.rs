@@ -11,6 +11,7 @@ pub mod patients;
 pub mod records;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_config::ConfigStore;
@@ -34,7 +35,7 @@ pub const KEYCHAIN_SERVICE_ENV: &str = "MYCHART_KEYCHAIN_SERVICE";
 pub struct Ctx {
     pub common: CommonArgs,
     pub store: ConfigStore,
-    pub vault: Box<dyn Vault>,
+    pub vault: Arc<dyn Vault>,
     pub lock: RefreshLock,
     pub cache_dir: PathBuf,
     /// Opens the sign-in URL; returns whether something was launched.
@@ -48,10 +49,10 @@ impl Ctx {
         Ok(Ctx {
             common,
             store: ConfigStore::new(BIN).with_override(config),
-            vault: Box::new(credential_store()),
+            vault: Arc::new(credential_store()),
             lock: RefreshLock::for_binary(BIN)?,
             cache_dir: crate::orgs::cache_dir()?,
-            browser: Box::new(crate::oauth::open_browser),
+            browser: Box::new(crate::browser::open_browser),
         })
     }
 
@@ -81,6 +82,28 @@ impl Ctx {
         if !self.common.quiet {
             eprintln!("{}", msg.as_ref());
         }
+    }
+
+    /// [`Self::note`] as a closure a FHIR client can own.
+    pub fn notes(&self) -> impl Fn(&str) + Send + Sync + 'static {
+        let quiet = self.common.quiet;
+        move |line: &str| {
+            if !quiet {
+                eprintln!("{line}")
+            }
+        }
+    }
+
+    /// `c`'s sign-in for a run of requests, renewed first when it is due.
+    pub fn live(
+        &self,
+        t: &BlockingTransport,
+        c: &Context,
+    ) -> Result<crate::session::Live<BlockingTransport>, CliError> {
+        Ok(
+            crate::session::Live::start(t, self.vault.clone(), &self.lock, c)?
+                .with_note(self.notes()),
+        )
     }
 }
 

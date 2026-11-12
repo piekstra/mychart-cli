@@ -914,18 +914,6 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi 5.3.0",
- "wasip2",
-]
-
-[[package]]
-name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
@@ -933,7 +921,7 @@ dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "r-efi 6.0.0",
+ "r-efi",
  "rand_core 0.10.1",
  "wasm-bindgen",
 ]
@@ -1348,13 +1336,12 @@ dependencies = [
 
 [[package]]
 name = "mychart-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "base64 0.22.1",
  "clap",
  "clap_complete",
- "getrandom 0.3.4",
  "pk-cli-auth",
  "pk-cli-config",
  "pk-cli-core",
@@ -1365,6 +1352,7 @@ dependencies = [
  "pk-cli-selfupdate",
  "pk-med-fhir",
  "pk-med-records",
+ "pk-med-smart",
  "predicates",
  "reqwest",
  "rsa",
@@ -1533,8 +1521,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-auth"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "getrandom 0.4.3",
@@ -1548,8 +1536,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-config"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "pk-cli-core",
  "serde",
@@ -1558,8 +1546,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-core"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "libc",
@@ -1570,8 +1558,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-documents"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "pk-cli-core",
  "serde",
@@ -1580,8 +1568,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-drive"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "pk-cli-core",
  "serde",
@@ -1590,8 +1578,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-http"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "pk-cli-core",
@@ -1601,8 +1589,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-secrets"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "keyring",
@@ -1615,8 +1603,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-selfupdate"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "flate2",
@@ -1629,8 +1617,8 @@ dependencies = [
 
 [[package]]
 name = "pk-med-fhir"
-version = "0.1.0"
-source = "git+https://github.com/piekstra/medical-common?tag=v0.1.0#7e1a66bdf26e869b46001a752393266c88c63fe9"
+version = "0.4.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.4.0#31724f0cb9dee3669e1625ce78e19adc013ee78f"
 dependencies = [
  "base64 0.22.1",
  "pk-cli-core",
@@ -1641,13 +1629,30 @@ dependencies = [
 
 [[package]]
 name = "pk-med-records"
-version = "0.1.0"
-source = "git+https://github.com/piekstra/medical-common?tag=v0.1.0#7e1a66bdf26e869b46001a752393266c88c63fe9"
+version = "0.4.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.4.0#31724f0cb9dee3669e1625ce78e19adc013ee78f"
 dependencies = [
  "pk-cli-core",
  "pk-med-fhir",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pk-med-smart"
+version = "0.4.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.4.0#31724f0cb9dee3669e1625ce78e19adc013ee78f"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.4.3",
+ "pk-cli-auth",
+ "pk-cli-core",
+ "pk-cli-secrets",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1842,12 +1847,6 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
-
-[[package]]
-name = "r-efi"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "r-efi"
@@ -2736,15 +2735,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
-name = "wasip2"
-version = "1.0.4+wasi-0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "wasm-bindgen"
 version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3007,12 +2997,6 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "wit-bindgen"
-version = "0.57.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "writeable"

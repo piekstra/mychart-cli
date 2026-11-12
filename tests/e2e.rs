@@ -13,11 +13,15 @@ use mock_epic::{MockEpic, Pick, CHILD_PATIENT, CLIENT_ID, ORG_ID, PROXY_USER, SE
 use mychart::cli::{AuthCmd, LoginArgs, LogoutArgs, PatientsCmd};
 use mychart::commands::{self, Ctx};
 use mychart::config::Config;
-use mychart::session::{self, Session};
-use mychart::vault::{self, MemoryVault};
+use std::sync::Arc;
+
+use mychart::session::{self, Live};
+use mychart::vault::{MemoryVault, Sessions};
 use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_config::ConfigStore;
 use pk_cli_core::{CliError, CommonArgs};
+use pk_cli_http::BlockingTransport;
+use pk_med_smart::{SessionStore, SmartSession};
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -66,7 +70,7 @@ fn ctx(dir: &Path, mock: &MockEpic, configure: impl FnOnce(&mut Config)) -> Ctx 
             ..CommonArgs::default()
         },
         store,
-        vault: Box::new(MemoryVault::default()),
+        vault: Arc::new(MemoryVault::default()),
         lock: RefreshLock::at(dir.join("token-refresh.lock")),
         cache_dir: dir.join("cache"),
         browser: Box::new(browser),
@@ -86,10 +90,33 @@ fn login(ctx: &Ctx, label: &str) {
     .unwrap();
 }
 
-fn stored(ctx: &Ctx, patient: &str) -> Session {
-    vault::get_json::<Session>(ctx.vault.as_ref(), &session::account(ORG_ID, patient))
+fn sessions(ctx: &Ctx) -> Sessions {
+    Sessions::new(ctx.vault.clone())
+}
+
+fn stored(ctx: &Ctx, patient: &str) -> SmartSession {
+    sessions(ctx)
+        .load(&session::account(ORG_ID, patient))
         .unwrap()
         .expect("a stored sign-in")
+}
+
+fn store(ctx: &Ctx, s: &SmartSession) {
+    sessions(ctx).save(s).unwrap();
+}
+
+fn live(ctx: &Ctx, c: &session::Context) -> Result<Live<BlockingTransport>, CliError> {
+    Live::start(
+        &commands::transport().unwrap(),
+        ctx.vault.clone(),
+        &ctx.lock,
+        c,
+    )
+}
+
+/// The context's session with a usable token, renewed when due.
+fn fresh(ctx: &Ctx, c: &session::Context) -> Result<SmartSession, CliError> {
+    live(ctx, c)?.fresh()
 }
 
 #[test]
@@ -100,40 +127,47 @@ fn a_sign_in_registers_the_install_and_renews_without_the_browser() {
     login(&ctx, "adult1");
 
     let s = stored(&ctx, SELF_PATIENT);
-    assert!(s.dynamic_client_id.is_some() && s.private_key.is_some());
+    assert!(s.dynamic_client.is_some());
     assert!(s.renewable());
     assert_eq!(s.client_id, CLIENT_ID);
-    assert_eq!(
-        s.fhir_user.as_deref(),
-        Some(format!("Patient/{SELF_PATIENT}").as_str())
-    );
+    // The session keeps the claim as Epic sent it; the index, `Type/id`.
+    assert!(s
+        .fhir_user
+        .as_deref()
+        .is_some_and(|u| u.ends_with(&format!("/Patient/{SELF_PATIENT}"))));
     assert_eq!(
         mock.get(|st| (st.registrations, st.jwt_bearer_grants)),
         (1, 1)
     );
+    // `openid` is asked for, so the authorization carried a nonce, which
+    // the ID token echoed (pk-med-smart refuses one that does not).
+    assert_eq!(mock.get(|st| st.nonces), 1);
 
     let contexts = ctx.contexts().unwrap();
     assert_eq!(contexts.len(), 1);
     assert_eq!(contexts[0].label.as_deref(), Some("adult1"));
     assert_eq!(contexts[0].relationship.as_deref(), Some("self"));
+    assert_eq!(
+        contexts[0].fhir_user.as_deref(),
+        Some(format!("Patient/{SELF_PATIENT}").as_str())
+    );
     assert_eq!(contexts[0].organization_name, mock_epic::ORG_NAME);
 
     // An expired access token renews through the JWT-bearer grant.
     let mut expired = s;
-    expired.expires_at = 0;
-    vault::set_json(ctx.vault.as_ref(), &contexts[0].account(), &expired).unwrap();
-    let t = commands::transport().unwrap();
-    let renewed = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &contexts[0]).unwrap();
-    assert!(renewed.is_fresh(session::now()));
-    assert_ne!(renewed.access_token, expired.access_token);
+    expired.tokens.expires_at = Some(0);
+    store(&ctx, &expired);
+    let renewed = fresh(&ctx, &contexts[0]).unwrap();
+    assert!(session::is_fresh(&renewed, session::now()));
+    assert_ne!(renewed.tokens.access_token, expired.tokens.access_token);
     assert_eq!(mock.get(|st| st.jwt_bearer_grants), 2);
     assert_eq!(
-        stored(&ctx, SELF_PATIENT).access_token,
-        renewed.access_token
+        stored(&ctx, SELF_PATIENT).tokens.access_token,
+        renewed.tokens.access_token
     );
 
     // A fresh token is used as is.
-    session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &contexts[0]).unwrap();
+    fresh(&ctx, &contexts[0]).unwrap();
     assert_eq!(mock.get(|st| st.jwt_bearer_grants), 2);
 
     // The profile's PatientContext: the Keychain account, never the token,
@@ -148,7 +182,7 @@ fn a_sign_in_registers_the_install_and_renews_without_the_browser() {
     assert_eq!(row.pointer("/status/authenticated"), Some(&true.into()));
     assert_eq!(row.pointer("/status/renewable"), Some(&true.into()));
     assert!(commands::auth::usable(&row));
-    assert!(!row.to_string().contains(&renewed.access_token));
+    assert!(!row.to_string().contains(&renewed.tokens.access_token));
     let bare = commands::auth::patient_dto(&contexts[0], None);
     assert!(bare.get("status").is_none() && !commands::auth::usable(&bare));
 
@@ -192,12 +226,10 @@ fn a_parent_reaches_a_child_through_proxy_access() {
     let left = ctx.contexts().unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].id, SELF_PATIENT);
-    assert!(vault::get_json::<Session>(
-        ctx.vault.as_ref(),
-        &session::account(ORG_ID, CHILD_PATIENT)
-    )
-    .unwrap()
-    .is_none());
+    assert!(sessions(&ctx)
+        .load(&session::account(ORG_ID, CHILD_PATIENT))
+        .unwrap()
+        .is_none());
 
     commands::auth::run(
         &ctx,
@@ -220,11 +252,10 @@ fn an_ended_access_period_asks_for_a_new_sign_in() {
     login(&ctx, "adult1");
     let c = ctx.contexts().unwrap().remove(0);
     let mut s = stored(&ctx, SELF_PATIENT);
-    s.expires_at = 0;
-    vault::set_json(ctx.vault.as_ref(), &c.account(), &s).unwrap();
+    s.tokens.expires_at = Some(0);
+    store(&ctx, &s);
     mock.set(|st| st.refuse_jwt_bearer = true);
-    let t = commands::transport().unwrap();
-    let Err(e) = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c) else {
+    let Err(e) = fresh(&ctx, &c) else {
         panic!("a refused renewal returned a session")
     };
     assert_eq!(e.exit_code(), 3, "{e}");
@@ -239,9 +270,9 @@ fn without_dynamic_registration_the_sign_in_lasts_its_hour() {
     let ctx = ctx(dir.path(), &mock, |_| {});
     login(&ctx, "adult1");
     let s = stored(&ctx, SELF_PATIENT);
-    assert!(s.dynamic_client_id.is_none());
+    assert!(s.dynamic_client.is_none());
     assert!(!s.renewable());
-    assert!(s.is_fresh(session::now()));
+    assert!(session::is_fresh(&s, session::now()));
     assert_eq!(mock.get(|st| st.registrations), 0);
 }
 
@@ -304,8 +335,8 @@ fn export_stream(
         .find(|c| c.id == patient)
         .unwrap();
     let t = commands::transport().unwrap();
-    let live = session::Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
-    let fhir = mychart::fhir::Fhir::new(&t, &live.fhir_base(), &live);
+    let live = live(ctx, &c).unwrap();
+    let fhir = mychart::fhir::Fhir::new(&t, &live).unwrap();
     let mut buf = Vec::new();
     let mut w =
         pk_med_records::RecordsWriter::start(&mut buf, &commands::records::header(&c, since))
@@ -737,25 +768,26 @@ fn a_failed_first_grant_keeps_the_registered_install() {
     let ctx = ctx(dir.path(), &mock, |_| {});
     mock.set(|st| st.refuse_jwt_bearer = true);
     login(&ctx, "adult1");
+    // The registered client is kept, its spent initial token due, and the
+    // refused first grant recorded.
     let s = stored(&ctx, SELF_PATIENT);
-    assert!(s.dynamic_client_id.is_some() && s.private_key.is_some());
-    assert_eq!(s.expires_at, 0);
+    assert!(s.dynamic_client.is_some());
+    assert_eq!(s.tokens.expires_at, Some(0));
+    assert!(s.refused_at.is_some());
+    assert!(!session::usable(&s, session::now()));
     assert_eq!(mock.get(|st| st.registrations), 1);
 
     let c = ctx.contexts().unwrap().remove(0);
-    let t = commands::transport().unwrap();
-    let Err(e) = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c) else {
+    let Err(e) = fresh(&ctx, &c) else {
         panic!("a refused grant returned a session")
     };
     assert_eq!(e.exit_code(), 3);
-    let refused = stored(&ctx, SELF_PATIENT);
-    assert!(refused.refused_at.is_some());
-    assert!(!refused.usable(session::now()));
+    assert!(stored(&ctx, SELF_PATIENT).refused_at.is_some());
 
     // A refusal is not final: the next use tries the grant once more.
     mock.set(|st| st.refuse_jwt_bearer = false);
-    let renewed = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
-    assert!(renewed.is_fresh(session::now()));
+    let renewed = fresh(&ctx, &c).unwrap();
+    assert!(session::is_fresh(&renewed, session::now()));
     assert!(stored(&ctx, SELF_PATIENT).refused_at.is_none());
     assert_eq!(mock.get(|st| st.registrations), 1);
 }
@@ -785,8 +817,8 @@ fn export_result(ctx: &Ctx, patient: &str) -> Result<(), CliError> {
         .find(|c| c.id == patient)
         .unwrap();
     let t = commands::transport().unwrap();
-    let live = session::Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = mychart::fhir::Fhir::new(&t, &live.fhir_base(), &live);
+    let live = live(ctx, &c)?;
+    let fhir = mychart::fhir::Fhir::new(&t, &live)?;
     let mut buf = Vec::new();
     let mut w =
         pk_med_records::RecordsWriter::start(&mut buf, &commands::records::header(&c, None))
@@ -854,13 +886,12 @@ fn the_registered_install_renews_even_when_a_refresh_token_is_held() {
     let c = ctx.contexts().unwrap().remove(0);
     let mut s = stored(&ctx, SELF_PATIENT);
     // A refresh token from the code exchange, issued to the app's client id.
-    s.refresh_token = Some("issued-to-the-app".into());
-    s.expires_at = 0;
-    vault::set_json(ctx.vault.as_ref(), &c.account(), &s).unwrap();
+    s.tokens.refresh_token = Some("issued-to-the-app".into());
+    s.tokens.expires_at = Some(0);
+    store(&ctx, &s);
     let before = mock.get(|st| st.jwt_bearer_grants);
-    let t = commands::transport().unwrap();
-    let renewed = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
-    assert!(renewed.is_fresh(session::now()));
+    let renewed = fresh(&ctx, &c).unwrap();
+    assert!(session::is_fresh(&renewed, session::now()));
     assert_eq!(mock.get(|st| st.jwt_bearer_grants), before + 1);
 }
 
@@ -928,22 +959,28 @@ fn a_401_to_a_token_another_process_replaced_uses_the_new_one_without_a_grant() 
     let ctx = ctx(dir.path(), &mock, |_| {});
     login(&ctx, "adult1");
     let c = ctx.contexts().unwrap().remove(0);
-    let t = commands::transport().unwrap();
-    let held = stored(&ctx, SELF_PATIENT).access_token;
+    let held = stored(&ctx, SELF_PATIENT).tokens.access_token.clone();
     let grants = mock.get(|st| st.jwt_bearer_grants);
+    let live = live(&ctx, &c).unwrap();
 
     // This process was refused an older token; the Keychain holds a newer one.
-    let s =
-        session::renew_refused(&t, ctx.vault.as_ref(), &ctx.lock, &c, "an-older-token").unwrap();
-    assert_eq!(s.access_token, held);
+    let s = live.after_refusal("an-older-token").unwrap();
+    assert_eq!(s.tokens.access_token, held);
     assert_eq!(mock.get(|st| st.jwt_bearer_grants), grants);
 
-    // Nor is the newer token marked when the older one was just issued.
-    let e = session::refuse(ctx.vault.as_ref(), &ctx.lock, &c, "an-older-token");
+    // A 401 to that token too ends this run, but another process has stored
+    // a newer one meanwhile, and that one is not marked.
+    let mut newer = stored(&ctx, SELF_PATIENT);
+    newer.tokens.access_token = "a-newer-token".into();
+    store(&ctx, &newer);
+    let Err(e) = live.after_refusal(&held) else {
+        panic!("a 401 to the token renewed to returned a session")
+    };
     assert_eq!(e.exit_code(), 3);
+    assert!(e.to_string().contains("another process"), "{e}");
     let kept = stored(&ctx, SELF_PATIENT);
     assert!(kept.refused_at.is_none());
-    assert!(kept.usable(session::now()));
+    assert!(session::usable(&kept, session::now()));
 }
 
 #[test]
@@ -956,21 +993,65 @@ fn a_401_with_no_way_to_renew_marks_the_sign_in_refused() {
     let s = stored(&ctx, SELF_PATIENT);
     assert!(!s.renewable());
     let c = ctx.contexts().unwrap().remove(0);
-    let t = commands::transport().unwrap();
 
-    let Err(e) = session::renew_refused(&t, ctx.vault.as_ref(), &ctx.lock, &c, &s.access_token)
+    let Err(e) = live(&ctx, &c)
+        .unwrap()
+        .after_refusal(&s.tokens.access_token)
     else {
         panic!("a refused token that cannot be renewed returned a session")
     };
     assert_eq!(e.exit_code(), 3);
     assert!(stored(&ctx, SELF_PATIENT).refused_at.is_some());
 
-    // Not fresh and not renewable: refused before any request.
+    // Refused and not renewable: refused before any request.
     let reads: usize = mock.get(|st| st.hits.values().sum());
-    let Err(e) = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c) else {
+    let Err(e) = fresh(&ctx, &c) else {
         panic!("a refused sign-in returned a session")
     };
     assert_eq!(e.exit_code(), 3);
-    assert!(e.message().contains("refused it on"), "{e}");
+    assert!(e.message().contains("has ended"), "{e}");
+    assert!(e.to_string().contains("auth login"), "{e}");
     assert_eq!(mock.get(|st| st.hits.values().sum::<usize>()), reads);
+}
+
+#[test]
+fn a_sign_in_stored_by_0_1_asks_for_a_new_one_and_logout_removes_it() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let c = ctx.contexts().unwrap().remove(0);
+    // mychart 0.1's item: its own shape under the same account.
+    ctx.vault
+        .write(
+            &c.account(),
+            r#"{"version":1,"access_token":"an-old-token","expires_at":0,"patient":"x"}"#,
+        )
+        .unwrap();
+
+    let held = commands::auth::stored(&ctx, &c).unwrap();
+    let row = commands::auth::status_row(&c, &held);
+    assert_eq!(row["status"]["authenticated"], false, "{row}");
+    assert!(row["status"]["unreadable"].is_string(), "{row}");
+    assert_eq!(row["credential_in_keychain"], true);
+    assert!(!row.to_string().contains("an-old-token"), "{row}");
+    commands::auth::run(&ctx, &AuthCmd::Status).unwrap();
+
+    let hits = mock.get(|st| st.hits.values().sum::<usize>());
+    let e = export_result(&ctx, SELF_PATIENT).unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    assert!(e.to_string().contains("auth login"), "{e}");
+    assert!(!e.to_string().contains("an-old-token"), "{e}");
+    assert_eq!(mock.get(|st| st.hits.values().sum::<usize>()), hits);
+
+    commands::auth::run(
+        &ctx,
+        &AuthCmd::Logout(LogoutArgs {
+            org: None,
+            patient: None,
+            forget: false,
+        }),
+    )
+    .unwrap();
+    assert!(ctx.vault.read(&c.account()).unwrap().is_none());
 }

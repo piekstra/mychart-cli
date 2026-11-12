@@ -2,20 +2,31 @@
 
 use std::time::Duration;
 
+use pk_cli_auth::oauth::{ClientAuth, OAuthClient};
 use pk_cli_auth::{AuthMethod, AuthStatus};
 use pk_cli_core::transport::Transport;
-use pk_cli_core::{output, CliError};
+use pk_cli_core::{block_on, output, CliError};
+use pk_med_smart::{
+    begin, decode_session, discover, register_dynamic_client, JwtSigner, LaunchRequest, Renewer,
+    RsaKey, ScopeSet, SessionStore, SmartApp, SmartSession,
+};
 use serde_json::{json, Value};
 
 use super::{orgs as orgs_cmd, rfc3339, transport, Ctx, BIN};
 use crate::cli::{AuthCmd, LoginArgs, LogoutArgs};
-use crate::config::REDIRECT_PATH;
-use crate::key::SigningKey;
-use crate::oauth::{self, LoopbackListener, Pkce};
+use crate::epic::{self, EpicQuirks};
+use crate::fhir::Fhir;
 use crate::orgs::{self, Org};
-use crate::session::{self, now, Context, Session};
-use crate::smart;
-use crate::vault;
+use crate::session::{self, now, Context};
+use crate::vault::Sessions;
+
+/// The per-install key's size. Epic accepts RS384 with 2048 bits or more;
+/// 3072 is NIST's size for keys used past 2030.
+const KEY_BITS: usize = 3072;
+
+fn now_u64() -> u64 {
+    now().max(0) as u64
+}
 
 pub fn run(ctx: &Ctx, cmd: &AuthCmd) -> Result<(), CliError> {
     match cmd {
@@ -81,20 +92,26 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
     lock.before_signin()?;
 
     let t = transport()?;
-    let endpoints = smart::discover(&t, &org.fhir_base, &client_id)?;
-    let listener = LoopbackListener::bind(cfg.redirect_port(), REDIRECT_PATH)?;
-    let redirect_uri = cfg.redirect_uri(listener.port());
-    let pkce = Pkce::generate()?;
-    let state = oauth::random_urlsafe(24)?;
-    let url = smart::authorize_url(
-        &endpoints,
-        &client_id,
-        &redirect_uri,
-        cfg.scope(),
-        &state,
-        &pkce.challenge,
-        org.aud(),
-    );
+    let quirks = EpicQuirks::for_client(&client_id);
+    let version = env!("CARGO_PKG_VERSION");
+    let config = block_on(discover(&t, &org.fhir_base, &quirks, BIN, version))?;
+    let client = ClientAuth::public(client_id.clone());
+    let app = SmartApp {
+        app: BIN.into(),
+        client: ClientAuth::public(client_id.clone()),
+        ports: vec![cfg.redirect_port()],
+    };
+    let signin = begin(
+        &app,
+        LaunchRequest {
+            config: &config,
+            fhir_base: &org.fhir_base,
+            aud: Some(org.aud()),
+            scopes: ScopeSet::parse(cfg.scope()),
+            quirks: &quirks,
+        },
+    )?;
+    let url = signin.url().to_string();
     let opened = !args.no_browser && (ctx.browser)(&url);
     eprintln!(
         "Sign in to {} in the browser{}. If a list of people appears, pick the one to link.\n\
@@ -102,16 +119,12 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
         org.name,
         if opened { " window that opened" } else { "" }
     );
-    let code = listener.wait_for_code(&state, Duration::from_secs(args.timeout * 60))?;
-    let granted = smart::exchange_code(
-        &t,
-        &endpoints,
-        &client_id,
-        &code,
-        &redirect_uri,
-        &pkce.verifier,
-    )?;
-    let patient = granted.patient.clone().ok_or_else(|| {
+    let code = signin.wait_for_code(Duration::from_secs(args.timeout * 60), |why| {
+        eprintln!("ignored an answer that is not this sign-in's: {why}")
+    })?;
+    let oauth = OAuthClient::new(t.clone(), BIN, version);
+    let mut session = block_on(signin.exchange(&oauth, &client, &code, &org.id, now_u64()))?;
+    let patient = session.patient.clone().ok_or_else(|| {
         CliError::Upstream(
             "the organization granted access without a patient; the app is not registered \
              for patients (docs/registration.md)"
@@ -123,84 +136,81 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
             "the organization granted access to a patient id that is not a FHIR id".into(),
         ));
     }
-    let fhir_user = granted.id_token.as_deref().and_then(smart::fhir_user);
+    let fhir_user = session
+        .fhir_user
+        .as_deref()
+        .and_then(epic::fhir_user_reference);
     let at = now();
-    let mut session = Session {
-        version: 1,
-        organization: org.id.clone(),
-        fhir_base: org.fhir_base.clone(),
-        token_endpoint: endpoints.token.clone(),
-        client_id: client_id.clone(),
-        dynamic_client_id: None,
-        private_key: None,
-        access_token: String::new(),
-        expires_at: 0,
-        refresh_token: None,
-        scope: String::new(),
-        patient: patient.clone(),
-        fhir_user: fhir_user.clone(),
-        signed_in_at: at,
-        refused_at: None,
-    };
-    session.apply(&granted, at);
 
-    match (&endpoints.register, cfg.dynamic_registration()) {
-        (Some(register), true) => {
-            ctx.note("registering this install with the organization, so access lasts past an hour");
-            let key = SigningKey::generate()?;
-            let dynamic = smart::register_dynamic_client(
-                &t,
-                register,
-                &granted.access_token,
-                &client_id,
-                &key,
-            )?;
-            // The registration used up the one-time initial token, so from
-            // here the dynamic client and its key are the sign-in: kept even
-            // when the first grant fails, which the next command retries.
-            session.private_key = Some(key.to_stored()?);
-            session.dynamic_client_id = Some(dynamic.clone());
-            match smart::jwt_bearer_grant(&t, &endpoints.token, &dynamic, &key, now()) {
-                Ok(renewed) => session.apply(&renewed, now()),
-                Err(e) => {
-                    session.expires_at = 0;
-                    ctx.note(format!(
-                        "warning: this install's first token request failed ({}); the sign-in \
-                         is stored and the next command asks again",
-                        e.message()
-                    ));
-                }
-            }
-        }
-        (None, true) if session.refresh_token.is_none() => ctx.note(format!(
-            "warning: {} offers this app no dynamic client registration; this sign-in lasts until {}",
-            org.name,
-            rfc3339(session.expires_at)
-        )),
-        _ => {}
+    let sessions = Sessions::new(ctx.vault.clone());
+    let register = config.registration_endpoint.is_some() && cfg.dynamic_registration();
+    if register {
+        ctx.note("registering this install with the organization, so access lasts past an hour");
+        let key = RsaKey::generate(KEY_BITS)?;
+        session = block_on(register_dynamic_client(
+            &oauth,
+            &config,
+            session,
+            &client_id,
+            key.jwks(),
+            &key,
+            key.to_pkcs8()?,
+        ))?;
+        // Epic's initial access token is for the registration only ("This
+        // token is intentionally one-time-use"), so the session is due from
+        // here: the first JWT-bearer grant, below or in the next command,
+        // gets the token the reads use.
+        session.tokens.expires_at = Some(0);
     }
-
+    lock.store_signin(|| sessions.save(&session))?;
     let context = Context {
         id: patient.clone(),
         organization: org.id.clone(),
         organization_name: org.name.clone(),
         fhir_base: org.fhir_base.clone(),
         label: args.label.clone(),
-        relationship: smart::relationship(fhir_user.as_deref(), &patient).map(str::to_string),
+        relationship: epic::relationship(fhir_user.as_deref(), &patient).map(str::to_string),
         fhir_user,
         signed_in_at: rfc3339(at),
     };
-    lock.store_signin(|| vault::set_json(ctx.vault.as_ref(), &context.account(), &session))?;
     ctx.index()?.upsert(context.clone())?;
 
+    if register {
+        let renewer_quirks = EpicQuirks::default();
+        let signer = |c: &pk_med_smart::DynamicClient| -> Result<Box<dyn JwtSigner>, CliError> {
+            Ok(Box::new(RsaKey::for_client(c)?))
+        };
+        let renewed = Renewer::new(&sessions, lock, &oauth, &client, &renewer_quirks)
+            .signer(&signer)
+            .renew(&context.account(), now_u64());
+        match renewed {
+            Ok(s) => session = s,
+            Err(e) => ctx.note(format!(
+                "warning: this install's first token request failed ({}); the sign-in \
+                 is stored and the next command asks again",
+                e.message()
+            )),
+        }
+    } else if session.tokens.refresh_token.is_none() && cfg.dynamic_registration() {
+        ctx.note(format!(
+            "warning: {} offers this app no dynamic client registration; this sign-in lasts until {}",
+            org.name,
+            session
+                .tokens
+                .expires_at_rfc3339()
+                .unwrap_or_else(|| "the organization ends it".into())
+        ));
+    }
+
     let verified = verify(&t, &session);
+    let expires_at = session.tokens.expires_at_rfc3339();
     let payload = json!({
         "schema": "auth-login/v1",
         "stored": true,
         "verified": verified,
         "patient": patient_dto(&context, Some(&session)),
         "renewable": session.renewable(),
-        "expires_at": rfc3339(session.expires_at),
+        "expires_at": expires_at,
     });
     if ctx.json() {
         output::json(&payload);
@@ -224,7 +234,10 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
             if session.renewable() {
                 "renews without a sign-in for the period chosen in MyChart".to_string()
             } else {
-                format!("ends at {}", rfc3339(session.expires_at))
+                format!(
+                    "ends at {}",
+                    expires_at.unwrap_or_else(|| "a time the organization did not say".into())
+                )
             }
         );
     }
@@ -239,29 +252,46 @@ fn is_fhir_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
-/// The token just granted, as a [`Bearer`](crate::fhir::Bearer).
-struct Granted<'a>(&'a str);
-
-impl crate::fhir::Bearer for Granted<'_> {
-    fn token(&self) -> Result<String, CliError> {
-        Ok(self.0.to_string())
-    }
-}
-
 /// One read of the patient's own record, to prove the session works,
 /// through the same origin and https checks as every other request. Only
-/// the resource type is looked at.
-fn verify<T: Transport>(t: &T, s: &Session) -> bool {
-    let bearer = Granted(&s.access_token);
-    crate::fhir::Fhir::new(t, &s.fhir_base, &bearer)
-        .read(&format!("Patient/{}", s.patient))
-        .is_ok_and(|r| r.resource_type == "Patient")
+/// the resource type is looked at. A session still waiting for its first
+/// grant has no token to read with.
+fn verify<T: Transport + Clone + Send + Sync + 'static>(t: &T, s: &SmartSession) -> bool {
+    let (Some(patient), false) = (&s.patient, s.tokens.is_expired(now_u64(), 0)) else {
+        return false;
+    };
+    Fhir::with_token(t, &s.fhir_base, s.bearer()).is_ok_and(|f| {
+        f.read(&format!("Patient/{patient}"))
+            .is_ok_and(|r| r.resource_type == "Patient")
+    })
+}
+
+/// What the Keychain holds for a context.
+pub enum Stored {
+    Missing,
+    /// An item this release cannot read (one mychart 0.1 stored, or a
+    /// damaged one): it needs a new sign-in, and `auth logout` removes it.
+    Unreadable(CliError),
+    Session(Box<SmartSession>),
+}
+
+impl Stored {
+    pub fn session(&self) -> Option<&SmartSession> {
+        match self {
+            Stored::Session(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn in_keychain(&self) -> bool {
+        !matches!(self, Stored::Missing)
+    }
 }
 
 /// The profile's `PatientContext` DTO. `session` names the Keychain item
 /// holding the sign-in, never its content; a stored session's state goes
 /// in the extra `status` object.
-pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
+pub fn patient_dto(c: &Context, session: Option<&SmartSession>) -> Value {
     let mut pc = c.patient_context();
     pc.session = Some(c.account());
     // Strings and optional strings: nothing to fail on.
@@ -270,17 +300,30 @@ pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
     v["fhir_base"] = c.fhir_base.clone().into();
     v["signed_in_at"] = c.signed_in_at.clone().into();
     if let Some(s) = session {
-        let usable = s.usable(now());
         v["status"] = json!({
-            "authenticated": usable,
+            "authenticated": session::usable(s, now()),
             "renewable": s.renewable(),
-            "expires_at": rfc3339(s.expires_at),
+            "expires_at": s.tokens.expires_at_rfc3339(),
         });
         if let Some(at) = s.refused_at {
-            v["status"]["refused_at"] = rfc3339(at).into();
+            v["status"]["refused_at"] = rfc3339(at as i64).into();
         }
     }
     v
+}
+
+/// [`patient_dto`] for whatever the Keychain holds.
+pub fn status_row(c: &Context, stored: &Stored) -> Value {
+    let mut row = patient_dto(c, stored.session());
+    if let Stored::Unreadable(e) = stored {
+        row["status"] = json!({
+            "authenticated": false,
+            "renewable": false,
+            "unreadable": e.message(),
+        });
+    }
+    row["credential_in_keychain"] = stored.in_keychain().into();
+    row
 }
 
 /// Whether a `patient_dto` row's stored sign-in can make requests.
@@ -290,9 +333,16 @@ pub fn usable(row: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// A context's stored session, or `None` when its Keychain item is gone.
-pub fn stored(ctx: &Ctx, c: &Context) -> Result<Option<Session>, CliError> {
-    vault::get_json::<Session>(ctx.vault.as_ref(), &c.account())
+/// A context's stored session. A Keychain that refuses the read is the
+/// error; an item that does not read is [`Stored::Unreadable`].
+pub fn stored(ctx: &Ctx, c: &Context) -> Result<Stored, CliError> {
+    let Some(text) = ctx.vault.read(&c.account())? else {
+        return Ok(Stored::Missing);
+    };
+    Ok(match decode_session(&text) {
+        Ok(s) => Stored::Session(Box::new(s)),
+        Err(e) => Stored::Unreadable(e),
+    })
 }
 
 fn status(ctx: &Ctx) -> Result<(), CliError> {
@@ -302,11 +352,9 @@ fn status(ctx: &Ctx) -> Result<(), CliError> {
     let mut any_usable = false;
     for c in &contexts {
         let s = stored(ctx, c)?;
-        any_stored |= s.is_some();
-        any_usable |= s.as_ref().is_some_and(|s| s.usable(now()));
-        let mut row = patient_dto(c, s.as_ref());
-        row["credential_in_keychain"] = s.is_some().into();
-        rows.push(row);
+        any_stored |= s.in_keychain();
+        any_usable |= s.session().is_some_and(|s| session::usable(s, now()));
+        rows.push(status_row(c, &s));
     }
     let mut status = AuthStatus::new(true, any_usable, AuthMethod::BrowserSession);
     status.credential_in_keychain = Some(any_stored);

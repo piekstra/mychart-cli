@@ -41,10 +41,13 @@ tokens)". [registration.md](registration.md) has the values mychart needs.
   development and testing" (oauth2), and "apps should not include
   localhost/loopback URIs in this list. An exception is for Native
   applications which are designed to use localhost for the redirect"
-  (oauth2, "Limit Use of Localhost URIs"). mychart is such a native app and
-  registers `http://127.0.0.1:7468/callback` and
-  `http://localhost:7468/callback`. Epic compares them exactly, so the port
-  is fixed (`mychart config set redirect_port`), never chosen at random.
+  (oauth2, "Limit Use of Localhost URIs"). mychart is such a native app. Its
+  redirect is `http://127.0.0.1:7468/callback`: the loopback listener
+  (cli-common's `pk-cli-auth`) binds and names only the IP literal (RFC
+  8252 §7.3). [registration.md](registration.md) also lists the
+  `http://localhost:7468/callback` spelling, which mychart does not send.
+  Epic compares redirect URIs exactly, so the port is fixed (`mychart
+  config set redirect_port`), never chosen at random.
   **Not settled by the docs:** whether a production organization accepts an
   http loopback URI. Redirect URIs stay editable after Ready for Production
   ("With the exception of adding redirect URIs and modifying your JWK Set
@@ -66,10 +69,13 @@ for Patient-facing applications at this time." (tutorial)
 
 What mychart does (oauth2, "Dynamic Client Registration"):
 
-1. Standalone launch with PKCE, as a public client. The access token it
-   returns is the RFC 7591 initial access token: "This token is
-   intentionally one-time-use and should be used for registration
-   immediately."
+1. Standalone launch with PKCE, as a public client, scope `openid
+   fhirUser`, with a fresh OpenID `nonce`. Epic's ID token carries it back:
+   "The nonce claim will be present only if it was specified in the
+   authorization request." pk-med-smart refuses an ID token without it, or
+   with another (exit 3). The access token the launch returns is the RFC
+   7591 initial access token: "This token is intentionally one-time-use
+   and should be used for registration immediately."
 2. "Generate a public-private key pair on the user's phone or computer" and
    "Securely store that device-specific key pair": a 3072-bit RSA key, kept
    in the Keychain item with the tokens.
@@ -78,13 +84,26 @@ What mychart does (oauth2, "Dynamic Client Registration"):
    [<public RSA JWK>]}}`. "software_id: This parameter must contain the
    application's client ID issued by Epic." The answer carries the dynamic
    `client_id`. Only RSA keys go inline: Epic accepts EC "only… for JWKS
-   returned from a JWKS URL".
+   returned from a JWKS URL". pk-med-smart's body also carries RFC 7591's
+   `token_endpoint_auth_method: "none"`, `grant_types: [<the JWT-bearer
+   grant>]`, `response_types: []` and `redirect_uris: []`, which describe
+   that client. **Not settled by the docs:** whether Epic ignores or refuses
+   those members; Epic's example sends only the two above. The sandbox
+   sign-in settles it.
 4. Every access token after that comes from the JWT-bearer grant (RFC 7523),
    which Epic recommends over a second launch for a refresh token:
    `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
    `assertion=<JWT>`, `client_id=<dynamic id>`. The JWT's `iss` and `sub`
    are the dynamic client id, `aud` is the token endpoint, `exp` at most 5
-   minutes out; mychart signs RS384.
+   minutes out (mychart: 4); mychart signs RS384. No `scope` goes with it:
+   Epic's example sends none, and a scope Epic did not grant could fail the
+   grant.
+
+mychart stores the sign-in, its registered client included, before the
+first JWT-bearer grant. A first grant that fails leaves the registered
+client in place, so the next command asks again without a new sign-in or
+a second registration. A refused one shows in `auth status` until then
+(below).
 
 Lifetimes:
 
@@ -106,13 +125,21 @@ no dynamic client) and asks again; another process that renewed meanwhile
 has stored a different token, which is used instead. When the grant is
 refused, the sign-in has no way to renew, or the server answers 401 to the
 token it has just issued (and the Keychain still holds that token), the
-Keychain item records `refused_at`: `auth status` shows the sign-in as not
+Keychain item records `refused_at` (pk-med-smart's `SmartSession`, stamped
+by its `Renewer` for a refused grant and by mychart for a 401 to the token
+just issued): `auth status` shows the sign-in as not
 authenticated (`status.refused_at` in `--json`, a `refused_at` column in
 the table), the refused token is not sent again, and the next command tries one renewal grant
 before any FHIR request, which clears it on success, so a refusal that
 passes does not cost a sign-in. A sign-in with no way to renew (no
 dynamic client and no refresh token) stays refused, exit 3, until `auth
 login`.
+
+Each Keychain item is one `SmartSession` (pk-med-smart, `format` 1), under
+the account `smart/<organization>/<patient>`. mychart 0.1 stored its own
+shape under the same account. 0.2 does not read it: `auth status` lists it
+with `status.unreadable`, any command for that patient exits 3 with the
+`auth login` command that replaces it, and `auth logout` deletes it unread.
 
 Epic's guidelines: an app holding persistent access without a BAA "informs
 the patient user of the period of time for which the app is seeking
@@ -244,6 +271,20 @@ range requests, so a failed download starts over.
 - **Observation, Condition, CarePlan and DocumentReference split by
   category**; a category an organization does not serve answers 400, which
   mychart records as an `unsupported` skip and goes on.
+- **What each refusal becomes** (pk-med-fhir maps the status and any
+  OperationOutcome issue code; mychart picks stop or skip):
+
+  | Answer | Exit or skip |
+  |---|---|
+  | 401, or an issue `login`, `unknown` or `expired`, after one renewal | stop, exit 3 |
+  | 403, or an issue `forbidden`, `suppressed` or `security` | `forbidden` skip |
+  | 404, 410, or an issue `not-found` or `deleted` | `not_found` skip |
+  | another 4xx | `unsupported` skip |
+  | 429, 5xx or an HTML 403 (an edge, not the server) after its retries; a body that is not the FHIR asked for | `upstream` skip |
+  | no answer after its retries | stop, exit 5 |
+
+  A search is read whole before any of it is written, so a page that fails
+  makes the whole search one skip: the stream holds no part of a search.
 - **Next links** are absolute URLs on the server's own spelling of the host,
   which can differ in case from the directory's; mychart compares origins
   without case and follows no link to another host. An attachment URL on
@@ -256,12 +297,16 @@ range requests, so a failed download starts over.
   reference are not bounded; the stream header names their types in
   `since_unbounded`, so a reader knows they may hold older resources. A
   `Binary` comes only from a dated `DocumentReference` or `DiagnosticReport`.
-- **Transient failures**: mychart tries a request again twice when it
-  answers 429, 500, 502, 503 or 504, waiting `Retry-After` (at most 30
-  seconds), and once when it gets no answer (the transport waits a minute
-  for one). Each retry prints a line on stderr. A 200 whose body is not FHIR
-  JSON (a maintenance page) is an `upstream` skip, as is a search entry that
-  is not a resource.
+- **Transient failures**: a request is sent at most three times when it gets
+  no answer (the transport waits a minute for one), a 429, a 5xx or an HTML
+  403: 1 then 2 seconds apart, or as long as `Retry-After` asks up to 30
+  seconds (a longer ask is not waited for; its answer is the skip). Each
+  retry prints a line on stderr. A 200 whose body is not FHIR JSON (a
+  maintenance page) is an `upstream` skip; a search entry that is not a
+  resource costs only itself and is counted in one `upstream` skip.
+- **A `Binary`** is asked for as FHIR JSON (`data` in base64). One answered
+  with another content type (the raw file) is an `upstream` skip, as is one
+  over the stream's line limit (`too_large`).
 - **The sandbox** is shared and refreshed weekly: "The Sandbox is refreshed
   every Sunday at approximately 8:00 PM Central Time"; a new app syncs to it
   in about an hour. Its test patients (`fhircamila`, `fhirderrick`,

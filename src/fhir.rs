@@ -1,45 +1,20 @@
-//! A read-only FHIR R4 client over one organization's base URL: reads,
-//! searches that follow `Bundle.link[next]`, and `Binary` fetches. Resources
-//! stay as the server's text (`pk_med_fhir::RawResource`, minified), because
-//! a `serde_json::Value` would rewrite a FHIR decimal such as `1.50`.
-//!
-//! The request layer stays here until `pk_med_fhir::FhirClient` takes a
-//! token source (an export outlives Epic's hour-long access token), tells a
-//! network failure from a 5xx, reports its retries, and reads a page around
-//! an entry that is not a resource.
+//! FHIR requests for one signed-in patient, over `pk_med_fhir::FhirClient`:
+//! the bearer from [`Live`] (renewed when due and once after a 401), the
+//! base's origin only, retries reported, resources kept as the server's
+//! text. This module turns the client's errors into what an export does
+//! next ([`Failure`]): stop, or record a skip and go on.
 
-use std::time::Duration;
+use pk_cli_core::transport::Transport;
+use pk_cli_core::{block_on, CliError, Reason};
+use pk_cli_secrets::Secret;
+use pk_med_fhir::{FhirClient, RetryPolicy, UNREACHABLE};
 
-use pk_cli_core::transport::{HttpRequest, HttpResponse, Transport};
-use pk_cli_core::{block_on, CliError};
-use serde::Deserialize;
-use serde_json::value::RawValue;
-use serde_json::Value;
-
-/// Pages one search follows before it stops and says so.
-pub const PAGE_CAP: usize = 100;
-/// The longest stream line (a Binary carries its document inline).
-pub const MAX_LINE_BYTES: usize = pk_med_records::MAX_LINE_BYTES;
-const RETRIES: usize = 2;
-const SEND_RETRIES: usize = 1;
-/// 401s handed to `Bearer::refused`: the first renews, the second (to the
-/// renewed token) ends the sign-in.
-const REFUSALS: usize = 2;
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+use crate::session::Live;
 
 pub use pk_med_fhir::{describe_json_error, RawResource};
 
-/// Supplies the bearer token, renewing it when it is due.
-pub trait Bearer {
-    fn token(&self) -> Result<String, CliError>;
-
-    /// The organization answered 401 to `token`: a new token to ask once
-    /// more with, the error to stop with, or `None` (no way to renew; the
-    /// 401 is the answer).
-    fn refused(&self, _token: &str) -> Option<Result<String, CliError>> {
-        None
-    }
-}
+/// The longest stream line (a Binary carries its document inline).
+pub const MAX_LINE_BYTES: usize = pk_med_records::MAX_LINE_BYTES;
 
 /// How one request failed, for a caller that records a skip and goes on.
 #[derive(Debug)]
@@ -58,7 +33,7 @@ impl Failure {
             Failure::Auth(e) | Failure::Fatal(e) => e,
             Failure::Skip { code, reason } => match code {
                 "not_found" => CliError::NotFound(reason),
-                "forbidden" => CliError::Auth(reason),
+                "forbidden" => CliError::Auth(reason).because(Reason::Forbidden),
                 "unsupported" => CliError::Usage(reason),
                 _ => CliError::Upstream(reason),
             },
@@ -76,15 +51,6 @@ impl From<CliError> for Failure {
     }
 }
 
-pub struct Fhir<'a, T: Transport> {
-    t: &'a T,
-    base: String,
-    bearer: &'a dyn Bearer,
-    user_agent: (&'static str, &'static str),
-    pub page_cap: usize,
-    note: Option<&'a dyn Fn(String)>,
-}
-
 /// The scheme, host and port, lower-cased: the directory spells some hosts
 /// in capitals while the server's own links do not.
 pub fn origin(url: &str) -> Option<String> {
@@ -100,567 +66,274 @@ pub fn origin(url: &str) -> Option<String> {
     ))
 }
 
-impl<'a, T: Transport> Fhir<'a, T> {
-    pub fn new(t: &'a T, base: &str, bearer: &'a dyn Bearer) -> Self {
-        Fhir {
-            t,
-            base: base.trim_end_matches('/').to_string(),
-            bearer,
-            user_agent: ("mychart", env!("CARGO_PKG_VERSION")),
-            page_cap: PAGE_CAP,
-            note: None,
-        }
-    }
-
-    /// Where a retry is reported, so a wait is never silent.
-    pub fn with_note(mut self, note: &'a dyn Fn(String)) -> Self {
-        self.note = Some(note);
-        self
-    }
-
-    fn tell(&self, line: String) {
-        if let Some(note) = self.note {
-            note(line)
-        }
-    }
-
-    pub fn base(&self) -> &str {
-        &self.base
-    }
-
-    /// `path` relative to the base (`Patient/123`, `/Observation?x=y`), or an
-    /// absolute URL on the base's origin. The token never goes elsewhere.
-    pub fn url(&self, path: &str) -> Result<String, CliError> {
-        if path.contains("://") {
-            if origin(path).is_none() || origin(path) != origin(&self.base) {
-                return Err(CliError::Usage(format!(
-                    "`{path}` is not on this organization's server ({}); the sign-in is sent only there",
-                    self.base
-                )));
-            }
-            return Ok(path.to_string());
-        }
-        Ok(format!("{}/{}", self.base, path.trim_start_matches('/')))
-    }
-
-    /// One GET with the token. Every request is a read, so a repeat is
-    /// harmless: a 429 or 5xx is tried again twice within `Retry-After`, a
-    /// request that got no answer once (the transport's own timeout is a
-    /// minute, so a second wait is the most worth spending), and a 401 once
-    /// with a renewed token. Each retry is reported through the note.
-    pub fn get(&self, path: &str, accept: &str) -> Result<HttpResponse, CliError> {
-        let url = self.url(path)?;
-        pk_cli_core::transport::require_secure_url(&url)?;
-        let (mut attempt, mut unanswered, mut refusals) = (0, 0, 0);
-        loop {
-            let token = self.bearer.token()?;
-            let req = HttpRequest::get(url.clone())
-                .header("Accept", accept)
-                .header("Authorization", format!("Bearer {token}"))
-                .user_agent(self.user_agent.0, self.user_agent.1);
-            let resp = match block_on(self.t.send(req)) {
-                Ok(resp) => resp,
-                Err(e) if unanswered < SEND_RETRIES && !e.is_auth() => {
-                    unanswered += 1;
-                    self.tell(format!("{}; trying once more", e.message()));
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            // A 401: the token was revoked or forgotten before its time.
-            // Renew it once and ask again; a 401 to the renewed one ends the
-            // sign-in (the bearer records that).
-            if resp.status == 401 && refusals < REFUSALS {
-                refusals += 1;
-                match self.bearer.refused(&token) {
-                    None => return Ok(resp),
-                    Some(Err(e)) => return Err(e),
-                    Some(Ok(_)) => {
-                        self.tell(format!(
-                            "{} refused the access token (HTTP 401); renewed it, asking again",
-                            origin(&url).unwrap_or_default()
-                        ));
-                        continue;
-                    }
-                }
-            }
-            if matches!(resp.status, 429 | 500 | 502 | 503 | 504) && attempt < RETRIES {
-                attempt += 1;
-                let wait = resp
-                    .header_value("retry-after")
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs)
-                    .unwrap_or(Duration::from_secs(2 * attempt as u64))
-                    .min(MAX_RETRY_WAIT);
-                self.tell(format!(
-                    "{} answered HTTP {}; trying again in {}s ({attempt}/{RETRIES})",
-                    origin(&url).unwrap_or_default(),
-                    resp.status,
-                    wait.as_secs()
-                ));
-                std::thread::sleep(wait);
-                continue;
-            }
-            return Ok(resp);
-        }
-    }
-
-    /// A GET whose failure is the caller's to record and go past: a URL on
-    /// another server (skipped as `off_origin`, the token not sent), a
-    /// refusal by status. Only the sign-in, the network or this machine
-    /// failing stops the caller.
-    fn checked(
-        &self,
-        path: &str,
-        accept: &str,
-        off_origin: &'static str,
-    ) -> Result<HttpResponse, Failure> {
-        if self.url(path).is_err() {
-            return Err(Failure::Skip {
-                code: off_origin,
-                reason: format!(
-                    "{} is not this organization's server ({}); the sign-in is not sent there",
-                    origin(path).unwrap_or_else(|| "the URL".into()),
-                    origin(&self.base).unwrap_or_default()
-                ),
-            });
-        }
-        let resp = self.get(path, accept)?;
-        if resp.is_success() {
-            return Ok(resp);
-        }
-        Err(status_failure(&resp))
-    }
-
-    /// One resource by `Type/id`. A body that is not FHIR JSON (a
-    /// maintenance page) is a skip.
-    pub fn read(&self, path: &str) -> Result<RawResource, Failure> {
-        let resp = self.checked(path, "application/fhir+json", "not_found")?;
-        parsed(&resp.body)
-    }
-
-    /// A `Binary` as a FHIR resource (`data` in base64).
-    pub fn binary(&self, reference: &str) -> Result<RawResource, Failure> {
-        let resp = self.checked(reference, "application/fhir+json", "no_file")?;
-        if resp.body.len() > MAX_LINE_BYTES {
-            return Err(Failure::Skip {
-                code: "too_large",
-                reason: format!(
-                    "{} bytes, over the stream's {MAX_LINE_BYTES}-byte line limit",
-                    resp.body.len()
-                ),
-            });
-        }
-        let r = parsed(&resp.body)?;
-        if r.resource_type != "Binary" {
-            return Err(Failure::Skip {
-                code: "upstream",
-                reason: format!("asked for a Binary and got a {}", r.resource_type),
-            });
-        }
-        Ok(r)
-    }
-
-    /// A search, page by page: `each` sees every resource in server order.
-    /// Returns the OperationOutcome messages the server attached and
-    /// whether the page cap stopped it.
-    pub fn search_each(
-        &self,
-        resource_type: &str,
-        params: &[(String, String)],
-        mut each: impl FnMut(RawResource) -> Result<(), Failure>,
-    ) -> Result<SearchSummary, Failure> {
-        let query = crate::oauth::form_encode(
-            &params
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect::<Vec<_>>(),
-        );
-        let mut next = Some(format!("{resource_type}?{query}"));
-        let mut summary = SearchSummary::default();
-        while let Some(url) = next.take() {
-            if summary.pages == self.page_cap {
-                summary.truncated = true;
-                break;
-            }
-            let resp = self.checked(&url, "application/fhir+json", "upstream")?;
-            summary.pages += 1;
-            let page: Page = serde_json::from_str(&resp.body).map_err(|e| Failure::Skip {
-                code: "upstream",
-                reason: format!(
-                    "the search result is not a FHIR Bundle: it {}",
-                    describe_json_error(&e)
-                ),
-            })?;
-            if page.resource_type != "Bundle" {
-                return Err(Failure::Skip {
-                    code: "upstream",
-                    reason: format!("the search returned a {}, not a Bundle", page.resource_type),
-                });
-            }
-            for entry in page.entry {
-                let Some(raw) = entry.resource else { continue };
-                let Ok(r) = RawResource::parse(raw.get()) else {
-                    summary.malformed += 1;
-                    continue;
-                };
-                let outcome = entry.search.as_ref().and_then(|s| s.mode.as_deref())
-                    == Some("outcome")
-                    || (r.resource_type == "OperationOutcome"
-                        && resource_type != "OperationOutcome");
-                if outcome {
-                    summary.outcomes.extend(outcome_messages(&r));
-                    continue;
-                }
-                each(r)?;
-            }
-            next = page
-                .link
-                .into_iter()
-                .find(|l| l.relation == "next")
-                .map(|l| l.url)
-                .filter(|u| !u.is_empty());
-            if let Some(u) = &next {
-                if origin(u) != origin(&self.base) {
-                    return Err(Failure::Skip {
-                        code: "upstream",
-                        reason:
-                            "the next page is on another server; not following it with the sign-in"
-                                .into(),
-                    });
-                }
-            }
-        }
-        Ok(summary)
-    }
-}
-
+/// What a search returned besides its resources.
 #[derive(Debug, Default)]
 pub struct SearchSummary {
     pub pages: usize,
+    /// What the OperationOutcomes the server attached say.
     pub outcomes: Vec<String>,
     pub truncated: bool,
     /// Entries left out because they were not FHIR resources.
     pub malformed: usize,
 }
 
-/// A response body as a resource; one that is not FHIR JSON is a skip.
-fn parsed(body: &str) -> Result<RawResource, Failure> {
-    RawResource::parse(body).map_err(|e| Failure::Skip {
-        code: "upstream",
-        reason: e.message().to_string(),
-    })
+/// A transport a FHIR client and its token source can own across a run.
+pub trait Wire: Transport + Clone + Send + Sync + 'static {}
+
+impl<T: Transport + Clone + Send + Sync + 'static> Wire for T {}
+
+pub struct Fhir<T> {
+    client: FhirClient<T>,
+    live: Option<Live<T>>,
 }
 
-#[derive(Deserialize)]
-struct Page<'a> {
-    #[serde(rename = "resourceType")]
-    resource_type: String,
-    #[serde(default)]
-    link: Vec<Link>,
-    #[serde(default, borrow)]
-    entry: Vec<Entry<'a>>,
-}
-
-#[derive(Deserialize)]
-struct Link {
-    #[serde(default)]
-    relation: String,
-    #[serde(default)]
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct Entry<'a> {
-    #[serde(default, borrow)]
-    resource: Option<&'a RawValue>,
-    #[serde(default)]
-    search: Option<EntrySearch>,
-}
-
-#[derive(Deserialize)]
-struct EntrySearch {
-    #[serde(default)]
-    mode: Option<String>,
-}
-
-/// `issue[].details.text` or `diagnostics`, shortened: what an
-/// OperationOutcome says, for a skip reason or an error message.
-pub fn outcome_messages(r: &RawResource) -> Vec<String> {
-    let Ok(v) = r.value() else {
-        return Vec::new();
-    };
-    v["issue"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|i| {
-            i.pointer("/details/text")
-                .and_then(Value::as_str)
-                .or_else(|| i["diagnostics"].as_str())
-                .or_else(|| i["code"].as_str())
-                .map(|s| s.chars().take(200).collect::<String>())
+impl<T: Wire> Fhir<T> {
+    /// Requests as `live`'s patient, to the base its session was issued for.
+    pub fn new(t: &T, live: &Live<T>) -> Result<Self, CliError> {
+        let source = live.clone();
+        let retries = live.clone();
+        let client = FhirClient::new(
+            t.clone(),
+            live.fhir_base(),
+            crate::commands::BIN,
+            env!("CARGO_PKG_VERSION"),
+        )?
+        .bearer_with(move |refused| source.token(refused))
+        .on_retry(move |line| retries.say(line));
+        Ok(Fhir {
+            client,
+            live: Some(live.clone()),
         })
-        .collect()
-}
+    }
 
-/// What a non-success status means for the caller.
-pub fn status_failure(resp: &HttpResponse) -> Failure {
-    let said = RawResource::parse(&resp.body)
-        .ok()
-        .filter(|r| r.resource_type == "OperationOutcome")
-        .map(|r| outcome_messages(&r).join("; "))
-        .filter(|s| !s.is_empty())
-        .map(|s| format!(": {s}"))
-        .unwrap_or_default();
-    let reason = format!("HTTP {}{said}", resp.status);
-    match resp.status {
-        401 => Failure::Auth(
-            CliError::Auth(format!(
-                "the organization no longer accepts this sign-in ({reason})"
-            ))
-            .with_remedy("sign in again with `mychart auth login --org <ORG>`"),
-        ),
-        403 => Failure::Skip {
-            code: "forbidden",
-            reason,
-        },
-        404 | 410 => Failure::Skip {
-            code: "not_found",
-            reason,
-        },
-        400 | 405 | 422 | 501 => Failure::Skip {
-            code: "unsupported",
-            reason,
-        },
-        _ => Failure::Skip {
-            code: "upstream",
-            reason,
-        },
+    /// Requests with one token and no renewal: the read that proves a
+    /// sign-in just made works.
+    pub fn with_token(t: &T, base: &str, token: Secret) -> Result<Self, CliError> {
+        let client = FhirClient::new(
+            t.clone(),
+            base,
+            crate::commands::BIN,
+            env!("CARGO_PKG_VERSION"),
+        )?
+        .bearer(token);
+        Ok(Fhir { client, live: None })
+    }
+
+    /// How often an answer that says nothing (a 429, a 5xx) is asked again.
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.client = self.client.retry(policy);
+        self
+    }
+
+    pub fn base(&self) -> &str {
+        self.client.base()
+    }
+
+    /// One resource by `Type/id`.
+    pub fn read(&self, path: &str) -> Result<RawResource, Failure> {
+        let (resource_type, id) = path.split_once('/').unwrap_or((path, ""));
+        block_on(self.client.read(resource_type, id)).map_err(|e| self.failure(e, "upstream"))
+    }
+
+    /// A `Binary` as a FHIR resource (`data` in base64), by `Binary/<id>` or
+    /// an absolute URL on this server. A file elsewhere is a skip, and the
+    /// token is not sent there.
+    pub fn binary(&self, reference: &str) -> Result<RawResource, Failure> {
+        if reference.contains("://") && origin(reference) != origin(self.base()) {
+            return Err(Failure::Skip {
+                code: "no_file",
+                reason: format!(
+                    "{} is not this organization's server ({}); the sign-in is not sent there",
+                    origin(reference).unwrap_or_else(|| "the URL".into()),
+                    origin(self.base()).unwrap_or_default()
+                ),
+            });
+        }
+        let b = block_on(self.client.binary(reference)).map_err(|e| self.failure(e, "no_file"))?;
+        if b.raw.len() > MAX_LINE_BYTES {
+            return Err(Failure::Skip {
+                code: "too_large",
+                reason: format!(
+                    "{} bytes, over the stream's {MAX_LINE_BYTES}-byte line limit",
+                    b.raw.len()
+                ),
+            });
+        }
+        Ok(b)
+    }
+
+    /// A search over every page (to the client's page cap), `each` seeing
+    /// every resource in server order. A page that fails fails the search:
+    /// the caller records it as one skip.
+    pub fn search_each(
+        &self,
+        resource_type: &str,
+        params: &[(String, String)],
+        mut each: impl FnMut(RawResource) -> Result<(), Failure>,
+    ) -> Result<SearchSummary, Failure> {
+        let params: Vec<(&str, String)> = params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let result = block_on(self.client.search(resource_type, &params))
+            .map_err(|e| self.failure(e, "upstream"))?;
+        let summary = SearchSummary {
+            pages: result.pages as usize,
+            outcomes: result.outcomes.iter().map(|o| o.summary()).collect(),
+            truncated: result.truncated,
+            malformed: result.unreadable.len(),
+        };
+        for r in result.resources.into_iter().chain(result.included) {
+            each(r)?;
+        }
+        Ok(summary)
+    }
+
+    /// The body of a 2xx for a path under the base, or an absolute URL on
+    /// this server (`api GET`).
+    pub fn get_raw(&self, path: &str) -> Result<String, CliError> {
+        block_on(self.client.get_raw(path)).map_err(|e| self.settle(e))
+    }
+
+    /// A 401 after this run renewed ends the sign-in, and says so.
+    fn settle(&self, e: CliError) -> CliError {
+        if e.is_auth() && e.reason() == Some(Reason::CredentialRefused) {
+            if let Some(ended) = self.live.as_ref().and_then(Live::ended_after_renewal) {
+                return ended;
+            }
+        }
+        e
+    }
+
+    /// Stop on the sign-in, the network or this machine; skip anything the
+    /// organization refused or answered with something unreadable.
+    /// `refused_name` is the skip for a reference this client will not
+    /// follow (a dot segment, a Binary URL that names no Binary).
+    fn failure(&self, e: CliError, refused_name: &'static str) -> Failure {
+        let e = self.settle(e);
+        if e.is_auth() {
+            return if e.reason() == Some(Reason::Forbidden) {
+                Failure::Skip {
+                    code: "forbidden",
+                    reason: e.message().to_string(),
+                }
+            } else {
+                Failure::Auth(e)
+            };
+        }
+        // By exit code: a reason or a remedy wraps the variant.
+        let code = match (e.exit_code(), e.reason()) {
+            (5, Some(UNREACHABLE)) => return Failure::Fatal(e),
+            (5, Some(Reason::BadRequest)) => "unsupported",
+            (5, _) => "upstream",
+            (4, _) => "not_found",
+            (2, _) => refused_name,
+            _ => return Failure::Fatal(e),
+        };
+        Failure::Skip {
+            code,
+            reason: e.message().to_string(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use pk_cli_core::transport::{HttpRequest, HttpResponse};
+    use std::sync::{Arc, Mutex};
 
     /// Answers from a script, one per request, counting them.
-    struct Scripted(RefCell<Vec<Result<HttpResponse, CliError>>>, RefCell<usize>);
+    #[derive(Clone, Default)]
+    struct Scripted(
+        Arc<Mutex<Vec<Result<HttpResponse, CliError>>>>,
+        Arc<Mutex<usize>>,
+    );
+
+    impl Scripted {
+        fn with(answers: Vec<Result<HttpResponse, CliError>>) -> Self {
+            Scripted(Arc::new(Mutex::new(answers)), Arc::default())
+        }
+
+        fn sent(&self) -> usize {
+            *self.1.lock().unwrap()
+        }
+    }
 
     impl Transport for Scripted {
         async fn send(&self, _: HttpRequest) -> Result<HttpResponse, CliError> {
-            *self.1.borrow_mut() += 1;
-            self.0.borrow_mut().remove(0)
+            *self.1.lock().unwrap() += 1;
+            self.0.lock().unwrap().remove(0)
         }
-    }
-
-    struct Token;
-    impl Bearer for Token {
-        fn token(&self) -> Result<String, CliError> {
-            Ok("t".into())
-        }
-    }
-
-    /// Answers in order, keeping each request's Authorization header.
-    struct Seen(
-        RefCell<Vec<Result<HttpResponse, CliError>>>,
-        RefCell<Vec<String>>,
-    );
-
-    impl Transport for Seen {
-        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, CliError> {
-            let auth = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
-            self.1.borrow_mut().push(auth);
-            self.0.borrow_mut().remove(0)
-        }
-    }
-
-    /// Renews `t1` to `t2` on a 401, and ends the sign-in on a 401 to `t2`.
-    struct Renewing(RefCell<String>, RefCell<usize>);
-
-    impl Bearer for Renewing {
-        fn token(&self) -> Result<String, CliError> {
-            Ok(self.0.borrow().clone())
-        }
-        fn refused(&self, token: &str) -> Option<Result<String, CliError>> {
-            *self.1.borrow_mut() += 1;
-            if token == "t2" {
-                return Some(Err(CliError::Auth("the sign-in has ended".into())));
-            }
-            *self.0.borrow_mut() = "t2".into();
-            Some(Ok("t2".into()))
-        }
-    }
-
-    #[test]
-    fn a_refused_token_is_renewed_once_and_the_request_asked_again() {
-        let t = Seen(
-            RefCell::new(vec![
-                ok(401, "{}"),
-                ok(200, r#"{"resourceType":"Patient","id":"p1"}"#),
-            ]),
-            RefCell::new(Vec::new()),
-        );
-        let bearer = Renewing(RefCell::new("t1".into()), RefCell::new(0));
-        let notes = RefCell::new(Vec::new());
-        let note = |s: String| notes.borrow_mut().push(s);
-        let fhir = Fhir::new(&t, "https://fhir.example.org/r4", &bearer).with_note(&note);
-        let r = fhir.read("Patient/p1").unwrap();
-        assert_eq!(r.id, "p1");
-        assert_eq!(*t.1.borrow(), ["Bearer t1", "Bearer t2"]);
-        assert_eq!(*bearer.1.borrow(), 1);
-        assert!(
-            notes.borrow()[0].contains("refused the access token"),
-            "{:?}",
-            notes.borrow()
-        );
-    }
-
-    #[test]
-    fn a_refused_renewed_token_ends_the_sign_in() {
-        let t = Seen(
-            RefCell::new(vec![ok(401, "{}"), ok(401, "{}")]),
-            RefCell::new(Vec::new()),
-        );
-        let bearer = Renewing(RefCell::new("t1".into()), RefCell::new(0));
-        let fhir = Fhir::new(&t, "https://fhir.example.org/r4", &bearer);
-        let Err(Failure::Auth(e)) = fhir.read("Patient/p1") else {
-            panic!("a second 401 did not end the sign-in")
-        };
-        assert_eq!(e.exit_code(), 3);
-        assert_eq!(t.1.borrow().len(), 2);
-        assert_eq!(*bearer.1.borrow(), 2);
-    }
-
-    #[test]
-    fn a_bearer_that_cannot_renew_takes_the_401_as_the_answer() {
-        let t = Seen(RefCell::new(vec![ok(401, "{}")]), RefCell::new(Vec::new()));
-        let fhir = Fhir::new(&t, "https://fhir.example.org/r4", &Token);
-        let Err(Failure::Auth(e)) = fhir.read("Patient/p1") else {
-            panic!("a 401 was not an auth failure")
-        };
-        assert_eq!(e.exit_code(), 3);
-        assert_eq!(t.1.borrow().len(), 1);
     }
 
     fn ok(status: u16, body: &str) -> Result<HttpResponse, CliError> {
-        Ok(HttpResponse::new(status, body).header("retry-after", "0"))
+        Ok(HttpResponse::new(status, body).header("Content-Type", "application/fhir+json"))
     }
 
-    fn unanswered() -> Result<HttpResponse, CliError> {
-        Err(CliError::Upstream(
-            "the request to https://fhir.example.org failed: operation timed out".into(),
-        ))
+    fn fhir(t: &Scripted) -> Fhir<Scripted> {
+        Fhir::with_token(t, "https://fhir.example.org/R4", Secret::new("t"))
+            .unwrap()
+            .retry(RetryPolicy::none())
     }
 
-    const PATIENT: &str = r#"{"resourceType":"Patient","id":"p1"}"#;
-
-    #[test]
-    fn a_request_without_an_answer_is_tried_once_more_and_said_so() {
-        let t = Scripted(
-            RefCell::new(vec![unanswered(), ok(200, PATIENT)]),
-            RefCell::new(0),
-        );
-        let notes = RefCell::new(Vec::new());
-        let note = |s: String| notes.borrow_mut().push(s);
-        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token).with_note(&note);
-        assert_eq!(fhir.read("Patient/p1").unwrap().id, "p1");
-        assert_eq!(*t.1.borrow(), 2);
-        assert_eq!(notes.borrow().len(), 1);
-        assert!(
-            notes.borrow()[0].contains("trying once more"),
-            "{:?}",
-            notes.borrow()
-        );
-
-        let t = Scripted(
-            RefCell::new(vec![unanswered(), unanswered()]),
-            RefCell::new(0),
-        );
-        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token);
-        assert!(matches!(fhir.read("Patient/p1"), Err(Failure::Fatal(_))));
-        assert_eq!(*t.1.borrow(), 2);
-    }
-
-    #[test]
-    fn a_busy_server_is_tried_twice_more_and_said_so() {
-        let t = Scripted(
-            RefCell::new(vec![ok(503, ""), ok(500, ""), ok(200, PATIENT)]),
-            RefCell::new(0),
-        );
-        let notes = RefCell::new(Vec::new());
-        let note = |s: String| notes.borrow_mut().push(s);
-        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token).with_note(&note);
-        assert!(fhir.read("Patient/p1").is_ok());
-        assert_eq!(*t.1.borrow(), 3);
-        assert_eq!(
-            *notes.borrow(),
-            [
-                "https://fhir.example.org answered HTTP 503; trying again in 0s (1/2)",
-                "https://fhir.example.org answered HTTP 500; trying again in 0s (2/2)",
-            ]
-        );
-
-        let t = Scripted(
-            RefCell::new(vec![ok(500, ""), ok(500, ""), ok(500, "")]),
-            RefCell::new(0),
-        );
-        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token);
-        assert!(matches!(
-            fhir.read("Patient/p1"),
-            Err(Failure::Skip {
-                code: "upstream",
-                ..
-            })
-        ));
-        assert_eq!(*t.1.borrow(), 3);
-    }
-
-    #[test]
-    fn a_parse_error_never_quotes_the_value() {
-        for body in [
-            r#"{"resourceType":"Patient","id":12345}"#,
-            r#"{"resourceType":"Patient","id":true}"#,
-            r#"{"resourceType":"Patient","id":"pat-0001""#,
-            "<html>Sam Example</html>",
-        ] {
-            let e = RawResource::parse(body).unwrap_err();
-            let text = e.to_string();
-            for secret in ["12345", "true", "pat-0001", "Sam", "Example"] {
-                assert!(!text.contains(secret), "{text}");
-            }
+    fn code(f: Result<RawResource, Failure>) -> &'static str {
+        match f {
+            Err(Failure::Skip { code, .. }) => code,
+            Err(Failure::Auth(_)) => "auth",
+            Err(Failure::Fatal(_)) => "fatal",
+            Ok(_) => "ok",
         }
     }
 
     #[test]
-    fn a_maintenance_page_and_a_file_elsewhere_are_skips() {
-        let t = Scripted(
-            RefCell::new(vec![ok(200, "<html>down</html>")]),
-            RefCell::new(0),
+    fn each_refusal_is_a_skip_and_only_the_sign_in_and_the_network_stop() {
+        let outcome = r#"{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing"}]}"#;
+        let t = Scripted::with(vec![
+            ok(200, "<html>down</html>"),
+            ok(403, outcome),
+            ok(404, outcome),
+            ok(400, outcome),
+            ok(500, outcome),
+            ok(401, outcome),
+            Err(CliError::Upstream("connection refused".into())),
+        ]);
+        let f = fhir(&t);
+        let got: Vec<&str> = (0..7).map(|_| code(f.read("Patient/p1"))).collect();
+        assert_eq!(
+            got,
+            [
+                "upstream",
+                "forbidden",
+                "not_found",
+                "unsupported",
+                "upstream",
+                "auth",
+                "fatal"
+            ]
         );
-        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token);
-        assert!(matches!(
-            fhir.read("Patient/p1"),
-            Err(Failure::Skip {
-                code: "upstream",
-                ..
-            })
-        ));
-        assert!(matches!(
-            fhir.binary("https://elsewhere.example.org/R4/Binary/b1"),
-            Err(Failure::Skip {
-                code: "no_file",
-                ..
-            })
-        ));
-        assert_eq!(*t.1.borrow(), 1, "the file elsewhere was requested");
+    }
+
+    #[test]
+    fn a_file_elsewhere_is_a_skip_and_never_requested() {
+        let t = Scripted::with(vec![]);
+        assert_eq!(
+            code(fhir(&t).binary("https://elsewhere.example.org/R4/Binary/b1")),
+            "no_file"
+        );
+        assert_eq!(
+            code(fhir(&t).binary("https://fhir.example.org/R4/Patient/p1")),
+            "no_file"
+        );
+        assert_eq!(t.sent(), 0);
+    }
+
+    #[test]
+    fn a_binary_over_the_line_limit_is_a_skip() {
+        let data = "A".repeat(MAX_LINE_BYTES);
+        let body = format!(r#"{{"resourceType":"Binary","id":"b1","data":"{data}"}}"#);
+        let t = Scripted::with(vec![ok(200, &body)]);
+        assert_eq!(code(fhir(&t).binary("Binary/b1")), "too_large");
     }
 
     #[test]

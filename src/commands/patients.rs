@@ -3,7 +3,7 @@
 use pk_cli_core::{output, CliError};
 use serde_json::{json, Value};
 
-use super::auth::{patient_dto, stored, usable};
+use super::auth::{patient_dto, status_row, stored, usable, Stored};
 use super::Ctx;
 use crate::cli::PatientsCmd;
 
@@ -11,11 +11,19 @@ pub fn run(ctx: &Ctx, cmd: &PatientsCmd) -> Result<(), CliError> {
     let PatientsCmd::List { status } = cmd;
     let mut items = Vec::new();
     for c in ctx.contexts()? {
-        let session = if *status { stored(ctx, &c)? } else { None };
-        let mut v = patient_dto(&c, session.as_ref());
-        if *status && session.is_none() {
-            v["status"] = json!({ "authenticated": false });
-        }
+        let v = if *status {
+            let held = stored(ctx, &c)?;
+            let mut v = status_row(&c, &held);
+            if let Stored::Missing = held {
+                v["status"] = json!({ "authenticated": false });
+            }
+            if let Some(row) = v.as_object_mut() {
+                row.remove("credential_in_keychain");
+            }
+            v
+        } else {
+            patient_dto(&c, None)
+        };
         items.push(v);
     }
     if ctx.json() {

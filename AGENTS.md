@@ -13,29 +13,32 @@ the `pk-cli-*` crates from [cli-common](https://github.com/piekstra/cli-common).
 | `src/cli.rs` | the clap tree |
 | `src/commands/*.rs` | one module per command group; `Ctx` (config, vault, lock, cache, browser) in `mod.rs` |
 | `src/orgs.rs` | Epic's Brands bundle: download, weekly cache, index, `--org` resolution, search |
-| `src/oauth.rs` | PKCE, the loopback listener, opening the browser |
-| `src/smart.rs` | discovery with `Epic-Client-ID`, authorize URL, code exchange, dynamic client registration, JWT-bearer and refresh grants |
-| `src/key.rs` | the per-install RSA key and its RS384 client assertion |
-| `src/session.rs` | the stored sign-in (`Session`), the patient index (`contexts.json`), `pick`, renewal under the refresh lock (`access_token`, `Live`) |
-| `src/vault.rs` | the Keychain behind a trait, so tests use memory |
-| `src/fsutil.rs` | owner-only files: written whole (`write_private`), or streamed and renamed on commit (`Staged`) |
-| `src/fhir.rs` | the request layer: reads, paged searches, `Binary`, retries, status to skip or error |
+| `src/epic.rs` | Epic's `VendorQuirks` (`Epic-Client-ID` on discovery, `/metadata` first, no scope on the JWT-bearer grant), `fhirUser` and the self/proxy relationship |
+| `src/browser.rs` | opening the sign-in page (`MYCHART_BROWSER` overrides the system's) |
+| `src/session.rs` | the patient index (`contexts.json`), `pick`, and `Live`: a context's token for a run, renewed by pk-med-smart's `Renewer` under the refresh lock, with 0.1's rule that a 401 to a just-renewed token ends the sign-in |
+| `src/vault.rs` | the Keychain behind a trait, so tests use memory; `Sessions`, the `SessionStore` over it |
+| `src/fsutil.rs` | owner-only files written whole (`write_private`, over `pk_cli_drive::private_file`) |
+| `src/fhir.rs` | `Fhir` over `pk_med_fhir::FhirClient` with `Live` as its token source; a request's error to stop or skip (`Failure`) |
 | `src/export.rs` | Epic's search plan, the export order, and the types `--since` leaves unbounded |
 | `tests/support/mock_epic.rs` | a mock Epic organization on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | Epic's behaviour and traps, quoted; read before changing auth or export |
 
-The stream (`RecordsWriter`, `Header`, `Skip`, the trailer), the DTOs and
-`records-export/v1` are medical-common's `pk-med-records`; `RawResource`, `normalize_base` and `describe_json_error`
-are its `pk-med-fhir` (v0.1.0, pinned with cli-common v0.31.0, the tag it
-builds on). `src/smart.rs` and the request layer in `src/fhir.rs` stand in
-for `pk-med-smart` and `pk_med_fhir::FhirClient` until medical-common
-v0.2.0, which adds what an Epic export needs from the client: a token
-source that renews mid-export, a network failure told from a 5xx, retry
-notes and pages read around an unreadable entry. `records.ndjson` is
-written through `fsutil::Staged`, renamed over the previous export only
-once its trailer is synced, until `pk-med-records`' `create_export_file`
-does the same (it renames the empty file into place first); unlike it,
-`Staged` replaces a symbolic link at the target rather than refusing one.
+medical-common v0.4.0 (pinned with cli-common v0.31.1, the tag it builds
+on) owns the protocol and the stream:
+
+- `pk-med-smart`: discovery, the standalone launch with PKCE, the code
+  exchange, dynamic client registration with an RSA key (`RsaKey`, feature
+  `rsa`), the JWT-bearer and refresh grants (`Renewer`), and the
+  `SmartSession` each Keychain item holds.
+- `pk-med-fhir`: `FhirClient` (reads, paged searches, `Binary`, retries,
+  the bearer from a token source, renewal after a 401, the base's origin
+  only), `RawResource` and `normalize_base`.
+- `pk-med-records`: the stream (`RecordsWriter`, `Header`, `Skip`, the
+  trailer), the DTOs, `records-export/v1`, and `create_export_file` for
+  `-o`.
+
+mychart keeps what is Epic's or its own: the directory, the quirks, the
+search plan, which failure is a skip, the patient index and the commands.
 Move every `pk-cli-*` and `pk-med-*` together, so the build holds one copy
 of each crate.
 

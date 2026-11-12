@@ -11,11 +11,10 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use pk_cli_core::transport::Transport;
 use pk_cli_core::CliError;
 use serde_json::Value;
 
-use crate::fhir::{Failure, Fhir, RawResource};
+use crate::fhir::{Failure, Fhir, RawResource, Wire};
 use pk_med_records::{RecordsWriter, Skip};
 
 /// The searches, as (resource type, extra parameters, whether `--since`
@@ -200,8 +199,8 @@ fn skip_of(
 }
 
 /// Run the export into `w`. `note` hears one line per search.
-pub fn run<T: Transport, W: std::io::Write>(
-    fhir: &Fhir<'_, T>,
+pub fn run<T: Wire, W: std::io::Write>(
+    fhir: &Fhir<T>,
     w: &mut RecordsWriter<W>,
     patient: &str,
     since: Option<&str>,
@@ -314,8 +313,8 @@ pub fn run<T: Transport, W: std::io::Write>(
 /// Each attachment's Binary, written right after the resource naming it.
 /// A Binary is fetched once per export: one that failed stays a skip rather
 /// than landing later after some other resource.
-fn binaries<T: Transport, W: std::io::Write>(
-    fhir: &Fhir<'_, T>,
+fn binaries<T: Wire, W: std::io::Write>(
+    fhir: &Fhir<T>,
     w: &mut RecordsWriter<W>,
     v: &Value,
     tried: &mut HashSet<String>,

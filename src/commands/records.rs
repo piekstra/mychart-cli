@@ -9,7 +9,7 @@ use crate::cli::{ExportArgs, RecordsCmd};
 use crate::export;
 use crate::fhir::{origin, Fhir};
 use crate::orgs;
-use crate::session::{now, Context, Live};
+use crate::session::{now, Context};
 use pk_med_records::{Header, RecordsExport, RecordsWriter, Source};
 
 pub fn run(ctx: &Ctx, cmd: &RecordsCmd) -> Result<(), CliError> {
@@ -70,9 +70,8 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
         .with_remedy(format!("pipe them into the encrypted vault: `{BIN} records export --patient {} --ndjson | medrec import --from mychart`", c.display())));
     }
     let t = transport()?;
-    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let tell = |line: String| ctx.note(line);
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let live = ctx.live(&t, &c)?;
+    let fhir = Fhir::new(&t, &live)?;
     let since = args.since.as_deref();
     let mut head = header(&c, since);
     head.organization.fhir_base = fhir.base().to_string();
@@ -106,18 +105,18 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
             }
         }
         Some(dir) => {
-            // The previous export is replaced only by a finished stream, its
-            // trailer written and synced; one cut short leaves it whole.
-            // pk-med-records' create_export_file renames an empty file into
-            // place first; this moves to it once it commits on success.
-            let mut staged = crate::fsutil::Staged::create(&dir.join(pk_med_records::EXPORT_FILE))?;
-            let mut out = std::io::BufWriter::new(staged.file());
+            // A complete stream replaces records.ndjson; one cut short goes
+            // to records.incomplete.ndjson and the last complete export is
+            // kept. Nothing at either name changes until the commit.
+            let mut file = pk_med_records::create_export_file(dir)?;
+            let mut out = std::io::BufWriter::new(file.file());
             let mut w = RecordsWriter::start(&mut out, &head)?;
             let result = export::run(&fhir, &mut w, &c.id, since, &note);
             let finished = w.finish(rfc3339(now()), result.as_ref().err())?;
+            std::io::Write::flush(&mut out)
+                .map_err(|e| CliError::Other(format!("writing the export: {e}")))?;
             drop(out);
-            let path = staged.path().to_path_buf();
-            staged.commit()?;
+            let path = file.commit(&finished)?;
             let payload = RecordsExport::new(path.display().to_string(), &finished);
             let trailer = &finished.trailer;
             if ctx.json() {

@@ -42,6 +42,9 @@ struct Pending {
     redirect_uri: String,
     patient: String,
     fhir_user: String,
+    /// The authorization's `nonce`, which Epic's ID token carries "only if it
+    /// was specified in the authorization request".
+    nonce: Option<String>,
 }
 
 struct Issued {
@@ -63,6 +66,8 @@ pub struct State {
     clients: HashMap<String, (String, String, Value)>,
     pub jwt_bearer_grants: usize,
     pub registrations: usize,
+    /// Authorizations that carried a `nonce`.
+    pub nonces: usize,
     /// resourceType → resources, parsed and as the text served (decimals
     /// such as `13.50` kept).
     pub resources: HashMap<String, Vec<(Value, String)>>,
@@ -145,6 +150,7 @@ impl MockEpic {
             clients: HashMap::new(),
             jwt_bearer_grants: 0,
             registrations: 0,
+            nonces: 0,
             resources: synthetic_resources(),
             refuse: vec![
                 ("Observation?category=sdoh".into(), 400),
@@ -401,6 +407,7 @@ fn serve(mut stream: TcpStream, port: u16, state: &Arc<Mutex<State>>) -> Option<
                 Pick::Myself => (SELF_PATIENT.to_string(), format!("Patient/{SELF_PATIENT}")),
                 Pick::Child => (CHILD_PATIENT.to_string(), PROXY_USER.to_string()),
             };
+            st.nonces += usize::from(q.contains_key("nonce"));
             let code = st.next("code");
             st.codes.insert(
                 code.clone(),
@@ -409,6 +416,7 @@ fn serve(mut stream: TcpStream, port: u16, state: &Arc<Mutex<State>>) -> Option<
                     redirect_uri: redirect.clone(),
                     patient,
                     fhir_user,
+                    nonce: q.get("nonce").cloned(),
                 },
             );
             drop(st);
@@ -527,6 +535,7 @@ fn token(
             // Keep the code's fhirUser for the registration that follows.
             let fhir_user = pending.fhir_user.clone();
             let patient = pending.patient.clone();
+            let nonce = pending.nonce.clone();
             let used = format!("used-{}", st.counter);
             st.codes.insert(used, pending);
             let token = st.next("initial");
@@ -542,7 +551,13 @@ fn token(
             let id_token = format!(
                 "{}.{}.sig",
                 B64.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
-                B64.encode(json!({ "sub": fhir_user, "fhirUser": format!("{origin}/api/FHIR/R4/{fhir_user}"), "exp": now() + 300 }).to_string())
+                B64.encode({
+                    let mut claims = json!({ "sub": fhir_user, "fhirUser": format!("{origin}/api/FHIR/R4/{fhir_user}"), "exp": now() + 300 });
+                    if let Some(nonce) = nonce {
+                        claims["nonce"] = nonce.into();
+                    }
+                    claims.to_string()
+                })
             );
             json_resp(
                 stream,

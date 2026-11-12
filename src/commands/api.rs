@@ -5,8 +5,7 @@ use pk_cli_core::CliError;
 
 use super::{transport, Ctx};
 use crate::cli::ApiArgs;
-use crate::fhir::{status_failure, Fhir};
-use crate::session::Live;
+use crate::fhir::{origin, Fhir};
 
 pub fn run(ctx: &Ctx, args: &ApiArgs) -> Result<(), CliError> {
     if !args.method.eq_ignore_ascii_case("GET") {
@@ -20,16 +19,20 @@ pub fn run(ctx: &Ctx, args: &ApiArgs) -> Result<(), CliError> {
             "the path is empty (for example `Patient/<id>`)".into(),
         ));
     }
+    let path = args.path.trim();
     let c = ctx.signed_in(&args.who)?;
-    let t = transport()?;
-    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let tell = |line: String| ctx.note(line);
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
-    fhir.url(&args.path)?;
-    let resp = fhir.get(&args.path, "application/fhir+json")?;
-    if !resp.is_success() {
-        return Err(status_failure(&resp).into_error());
+    // Refused before the Keychain is read: the sign-in goes only to the
+    // server it was made at.
+    if path.contains("://") && (origin(path).is_none() || origin(path) != origin(&c.fhir_base)) {
+        return Err(CliError::Usage(format!(
+            "`{path}` is not on this organization's server ({}); the sign-in is sent only there",
+            c.fhir_base
+        )));
     }
-    println!("{}", resp.body.trim_end());
+    let t = transport()?;
+    let live = ctx.live(&t, &c)?;
+    let fhir = Fhir::new(&t, &live)?;
+    let body = fhir.get_raw(path.trim_start_matches('/'))?;
+    println!("{}", body.trim_end());
     Ok(())
 }
