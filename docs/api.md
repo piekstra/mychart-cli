@@ -1,0 +1,249 @@
+# Epic's patient-access API: what mychart relies on
+
+Read from Epic's documentation on 2026-11-12 (fhir.epic.com renders with
+JavaScript; it was read in a real browser) and checked against Epic's
+public sandbox. Quotations are Epic's wording. Sources:
+
+| Short name | Page |
+|---|---|
+| oauth2 | <https://fhir.epic.com/Documentation?docId=oauth2> |
+| tutorial | <https://fhir.epic.com/Documentation?docId=oauth2tutorial> |
+| patient apps | <https://fhir.epic.com/Documentation?docId=patientfacingfhirapps> |
+| request process | <https://fhir.epic.com/Documentation?docId=epiconfhirrequestprocess> |
+| guidelines | <https://fhir.epic.com/Documentation?docId=developerguidelines> |
+| patient auth | <https://open.epic.com/Tutorial/PatientAuthentication> |
+| endpoints | <https://open.epic.com/MyApps/Endpoints> |
+
+## 1. Registering a patient-facing app
+
+The form ("request process"): "The app name / The app consumer type /
+Applicable APIs / The default FHIR version / Applicable redirect URIs /
+Whether you'll use the confidential client profile (required for refresh
+tokens)". [registration.md](registration.md) has the values mychart needs.
+
+- **Audience**: Patients ("For patients and their caretakers authenticating
+  with MyChart").
+- **APIs**: only those on Epic's USCDI v3 list keep automatic distribution
+  (section 3). Selecting `ImagingStudy`, `ExplanationOfBenefit` or any other
+  API outside it ends that for every organization.
+- **FHIR version**: R4. `fhirUser` in the id token needs it: "The fhirUser
+  claim will only be present if app has the R4 (or greater) SMART on FHIR
+  version selected, and requests both the openid and fhirUser scopes"
+  (oauth2).
+- **Public, not confidential.** "If your application launches without SSO,
+  and specifically does not include a web server component at all, then you
+  can keep this unchecked" (tutorial). A public client registers no
+  credential: "you will not register credentials (public keys or client
+  secrets) when building your app and will configure your library to use
+  client authentication type "none."" (tutorial). So no JWK Set URL.
+- **Redirect URIs**: "An https protocol is required for use in a production
+  environment, but http protocol-based redirect_uris are allowed for
+  development and testing" (oauth2), and "apps should not include
+  localhost/loopback URIs in this list. An exception is for Native
+  applications which are designed to use localhost for the redirect"
+  (oauth2, "Limit Use of Localhost URIs"). mychart is such a native app and
+  registers `http://127.0.0.1:7468/callback` and
+  `http://localhost:7468/callback`. Epic compares them exactly, so the port
+  is fixed (`mychart config set redirect_port`), never chosen at random.
+  **Not settled by the docs:** whether a production organization accepts an
+  http loopback URI. Redirect URIs stay editable after Ready for Production
+  ("With the exception of adding redirect URIs and modifying your JWK Set
+  URLs, all technical changes will require you to build a new app"), so an
+  https page that forwards `code` and `state` to the loopback can be added
+  later if one does not.
+- **After Ready for Production** nothing else changes, and an app "cannot be
+  deactivated" once deployed (request process).
+
+## 2. Refresh tokens, dynamic client registration, lifetimes
+
+A public client gets no refresh token: "If you are using a client-side OAuth
+2.0 library, you cannot use the "refresh_token" grant type for persistent
+access to APIs (>1 hour of access)… If you cannot add a server component to
+your application, you can add dynamic client registration to your
+client-side only application and follow the directions here to use your
+initial access token to get persistent access. This app is only available
+for Patient-facing applications at this time." (tutorial)
+
+What mychart does (oauth2, "Dynamic Client Registration"):
+
+1. Standalone launch with PKCE, as a public client. The access token it
+   returns is the RFC 7591 initial access token: "This token is
+   intentionally one-time-use and should be used for registration
+   immediately."
+2. "Generate a public-private key pair on the user's phone or computer" and
+   "Securely store that device-specific key pair": a 3072-bit RSA key, kept
+   in the Keychain item with the tokens.
+3. `POST` the `register` endpoint with `Authorization: Bearer <initial
+   token>` and `{"software_id": <the app's client id>, "jwks": {"keys":
+   [<public RSA JWK>]}}`. "software_id: This parameter must contain the
+   application's client ID issued by Epic." The answer carries the dynamic
+   `client_id`. Only RSA keys go inline: Epic accepts EC "only… for JWKS
+   returned from a JWKS URL".
+4. Every access token after that comes from the JWT-bearer grant (RFC 7523),
+   which Epic recommends over a second launch for a refresh token:
+   `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
+   `assertion=<JWT>`, `client_id=<dynamic id>`. The JWT's `iss` and `sub`
+   are the dynamic client id, `aud` is the token endpoint, `exp` at most 5
+   minutes out; mychart signs RS384.
+
+Lifetimes:
+
+| What | Lifetime | Epic's wording |
+|---|---|---|
+| Access token | about an hour (`expires_in` 3240 to 3600 in Epic's examples) | "the number of seconds for which the access token is valid" |
+| id token | 5 minutes | "This is set to the current time plus 5 minutes." |
+| Dynamic client | the period the patient chose | "For the duration the user selected when approving your app… your app can get an access token whenever it needs using the JWT bearer authorization grant" |
+| That period | chosen in MyChart from the organization's options, 1 hour to 1 year on Epic's screenshots; indefinite only if the organization configures it | "In patient-facing contexts, it can be set by the patient through MyChart"; "Note that this only gives patients the option of indefinite access. Each patient still chooses their max access period." |
+
+`mychart auth status` shows each sign-in's `renewable` flag and token
+expiry; when the period ends the grant fails and mychart asks for a new
+`auth login` (exit 3).
+
+Epic's guidelines: an app holding persistent access without a BAA "informs
+the patient user of the period of time for which the app is seeking
+authorization and obtains the patient user's consent" (guidelines). MyChart's
+own access-period page does that; mychart prints what it got.
+
+## 3. How a production client id reaches organizations
+
+"Epic customers receive licenses of applications automatically on a rolling
+12-hour cycle." (request process) Automatic distribution applies when the
+app (patient apps):
+
+- "Uses only USCDI v3 FHIR APIs" (Epic August 2024 and later)
+- "Only reads data from Epic"
+- "Is patient-facing"
+- "Does not use refresh tokens OR uses refresh tokens and has a client
+  credential uploaded by the vendor for that community member"
+- "Selects "Enable Auto-download" and "USCDI v1" or "USCDI v3" on the app
+  creation page"
+- "Is marked "Ready for Production""
+
+and the organization "Has not disabled auto-download functionality". Also:
+"All US provider organizations currently receive client IDs that meet the
+automatic distribution criteria." There is no per-organization activation
+for such an app. A sign-in in the first 12 hours after Ready for Production,
+or at an organization that turned auto-download off, fails with an
+unknown-client error.
+
+mychart's app uses no refresh tokens (the JWT-bearer grant is not one), so
+it meets the condition; the docs do not say outright how a dynamic client
+is counted.
+
+## 4. Proxy access (a parent and a child)
+
+MyChart asks at sign-in. Epic's patient guide: "If you have access to
+another person's account, you will need to select to which account you are
+linking the app." Its screenshot reads "Which patient do you want
+<application name> to be able to link to? Yourself / Your child" (patient
+auth). One sign-in links one patient, so a parent signs in once per child
+(`mychart auth login --org <ORG> --label <child>`).
+
+The token response's `patient` is the patient picked. The id token says who
+signed in: "MyChart self access workflows: Patient resource / MyChart proxy
+access workflows: RelatedPerson resource" (oauth2, `sub` and `fhirUser`).
+mychart records `relationship: self` when `fhirUser` is `Patient/<patient>`
+and `proxy` otherwise. The proxy's RelatedPerson "is represented by a
+MyChart account record ID and their link to a Patient record ID" (the
+RelatedPerson (Proxy) spec).
+
+## 5. What a patient app reads; notes and PDFs
+
+A patient app reads the APIs it registered, of those the patient allows:
+"In some cases, you may be able to select what information to share" (patient
+auth). A category the patient withheld answers 403, which mychart records as a
+`forbidden` skip. The USCDI v3 list is in [registration.md](registration.md).
+
+Documents are `DocumentReference` + `Binary`:
+
+- Clinical notes: `DocumentReference?patient=<id>&category=clinical-note`;
+  "This should be set to "clinical-note" to restrict the search results to
+  only include the Clinical Notes sub-resource." Each note has HTML and RTF
+  attachments: "The MIME content type of the note text. This may be
+  text/rtf or text/html." Scanned documents carry other types.
+- Lab reports: `DocumentReference (Labs)` and `Binary.Read (Labs)`; the
+  Binary is the report, "first converted to HTML" or a PDF.
+- `Binary` with `Accept: application/fhir+json` "is returned as a structured
+  FHIR resource response with the content Base64-encoded and returned in
+  the "data" element. Alternatively, if one of those Accept header values is
+  not specified, the raw content is returned directly". mychart always asks
+  for the FHIR form; the stream carries the Binary resource right after the
+  DocumentReference or DiagnosticReport naming it.
+
+Imaging: `ImagingStudy` is not on the USCDI v3 auto-download list, so
+mychart's app does not select it. The list has `Binary (Study)`, `Media
+(Study)` and `Observation (Study Finding)`: imaging reports and findings.
+No API on the list serves DICOM images to a patient; images come from the
+facilities (medrec).
+
+## 6. NYU Langone
+
+In the User-access Brands bundle (`https://open.epic.com/Endpoints/Brands`):
+brand id `718`, R4 base `https://epicfhir.nyumc.org/FHIRPRD/api/FHIR/R4`.
+The deprecated R4 Endpoint bundle (`https://open.epic.com/Endpoints/R4`)
+lists the same base with a trailing slash. `mychart orgs search nyu` finds
+it.
+
+## The organization directory
+
+"Applications SHOULD NOT perform runtime queries for endpoint data hosted
+on open.epic.com. Applications should reguarly (for example, weekly)
+download endpoint information" (endpoints). The Brands bundle is
+a FHIR collection Bundle of about 97 MB on 2026-11-12, brand `Organization`s
+(identifier system `https://open.epic.com/brand-identifier`), their
+locations (`partOf`), and `Endpoint`s. mychart downloads it at most once a
+week into `~/.cache/mychart/orgs.json` (an index of the primary brands with
+an active endpoint) and never queries it per lookup. The server ignores
+range requests, so a failed download starts over.
+
+## Traps
+
+- **`Epic-Client-ID` on `/metadata`.** "If you do not send the
+  Epic-Client-ID HTTP header with the appropriate production or
+  non-production client ID… you can receive the wrong token and authorize
+  endpoints" (oauth2). The `register` endpoint appears only for a client id
+  allowed to register dynamic clients; the sandbox's
+  `.well-known/smart-configuration` has no `registration_endpoint` at all.
+  mychart reads the CapabilityStatement with the header and falls back to
+  smart-configuration.
+- **`aud` is required** ("Starting in the May 2023 version of Epic, this
+  parameter will be required"). mychart sends the directory's address
+  untouched: the directory spells some hosts in capitals (`FHIR.KP.ORG`) and
+  some bases with a trailing slash.
+- **PKCE is S256 only**: "Currently, only the S256 method is supported."
+- **Standalone launch is GET**: "POST requests are supported for EHR launches
+  in Epic version November 2020 and later, and are not currently supported
+  for standalone launches" (oauth2).
+- **Scopes**: "The scope parameter is set to "openid fhirUser"… Epic issues
+  additional scopes based on the incoming APIs you configured on your
+  application", and of `launch`: "Do not add it for standalone launches"
+  (tutorial). mychart asks for `openid fhirUser` (`config set scope` changes
+  it). `offline_access` is not needed: dynamic registration gives the
+  persistent access.
+- **An empty search is not empty**: Epic answers with an `OperationOutcome`
+  entry (`search.mode = outcome`, "No results were found"); mychart drops
+  it from the stream.
+- **Observation, Condition, CarePlan and DocumentReference split by
+  category**; a category an organization does not serve answers 400, which
+  mychart records as an `unsupported` skip and goes on.
+- **Next links** are absolute URLs on the server's own spelling of the host,
+  which can differ in case from the directory's; mychart compares origins
+  without case and follows no link to another host.
+- **The sandbox** is shared and refreshed weekly: "The Sandbox is refreshed
+  every Sunday at approximately 8:00 PM Central Time"; a new app syncs to it
+  in about an hour. Its test patients (`fhircamila`, `fhirderrick`,
+  `fhirdesiree`, password `epicepic1`) are synthetic and published by Epic.
+
+## Kaiser Permanente
+
+Kaiser's clinical records are Epic. The Brands bundle lists eight regional
+brands, each an `--org`: Colorado, Georgia, Hawaii, Mid-Atlantic, Northern
+California, Northwest and Southern California under
+`https://fhir.kp.org/service/ptnt_care/EpicEdiFhirRoutingSvc/v2014/esb-envlbl/<n>/api/FHIR/R4`
+(`n` = 140, 200, 130, 170, 326, 190, 226), and Washington at
+`https://fhir.kp.org/Interconnect-FHIR-PRD/api/FHIR/R4`. Their authorization
+server is elsewhere (`https://fhir.kp.org/KPPolarisPortal/esb-envlbl/<n>/oauth2`),
+which discovery finds. Kaiser's guide: "No approval (beyond the OAuth
+security flow) is needed for the open.epic API" and "All testing is done
+with Epic in their Testing Sandbox." The deprecated R4 bundle disagrees on
+two regions' numbers; mychart uses Brands.

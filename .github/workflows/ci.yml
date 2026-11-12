@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The hot path — every push and PR — runs on ubuntu only. The test suite is
+# deliberately keychain-free (AGENTS.md), so a macOS runner would exercise
+# nothing more; macOS coverage comes from the tag-only release build plus
+# local `make verify` before push.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `keyring` crate uses the D-Bus Secret Service on Linux, so its
+      # native dep `libdbus-sys` needs the system library + pkg-config to build.
+      # (macOS/Windows use native backends and need nothing.)
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: smoke
+        run: make smoke
+
+  security:
+    runs-on: ubuntu-latest
+    # gitleaks-action calls the PR API to enumerate the commits to scan, so it
+    # needs more than the workflow-level `contents: read`. Without these the
+    # job dies with "Resource not accessible by integration" — but only on
+    # pull_request events, so it passes on main and fails on the first PR.
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # No system deps here: cargo-audit and cargo-deny resolve metadata from
+      # Cargo.lock without compiling the tree, so the keyring/libdbus native
+      # build never runs. (The `verify` job, which does compile, installs it.)
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: cargo-deny
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

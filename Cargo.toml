@@ -1,0 +1,51 @@
+[package]
+name = "mychart-cli"
+description = "Pull your own health records from any Epic MyChart organization through Epic's patient-access SMART on FHIR API. Unofficial; not affiliated with Epic Systems."
+version = "0.1.0"
+edition = "2021"
+# pk-cli-auth's refresh lock (File::lock) needs 1.89.
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/piekstra/mychart-cli"
+homepage = "https://github.com/piekstra/mychart-cli"
+authors = ["piekstra"]
+keywords = ["fhir", "smart-on-fhir", "epic", "mychart", "health-records"]
+categories = ["command-line-utilities"]
+publish = false
+
+[lib]
+name = "mychart"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mychart"
+path = "src/main.rs"
+
+[dependencies]
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0", features = ["reqwest"] }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+pk-cli-documents = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+base64 = "0.22"
+getrandom = "0.3"
+sha2 = "0.11"
+# The per-install key Epic's dynamic client registration needs (docs/api.md).
+rsa = { version = "0.10", features = ["pkcs1v15"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
