@@ -232,9 +232,16 @@ fn verify<T: Transport>(t: &T, s: &Session) -> bool {
     }
 }
 
-/// The profile's `PatientContext` DTO.
+/// The profile's `PatientContext` DTO. `session` names the Keychain item
+/// holding the sign-in, never its content; a stored session's state goes
+/// in the extra `status` object.
 pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
-    let mut v = json!({ "id": c.id, "organization": c.organization });
+    let mut v = json!({
+        "id": c.id,
+        "organization": c.organization,
+        "kind": "patient",
+        "session": c.account(),
+    });
     if let Some(l) = &c.label {
         v["label"] = l.clone().into();
     }
@@ -249,13 +256,20 @@ pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
     v["signed_in_at"] = c.signed_in_at.clone().into();
     if let Some(s) = session {
         let usable = s.is_fresh(now()) || s.renewable();
-        v["session"] = json!({
+        v["status"] = json!({
             "authenticated": usable,
             "renewable": s.renewable(),
             "expires_at": rfc3339(s.expires_at),
         });
     }
     v
+}
+
+/// Whether a `patient_dto` row's stored sign-in can make requests.
+pub fn usable(row: &Value) -> bool {
+    row.pointer("/status/authenticated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// A context's stored session, or `None` when its Keychain item is gone.
@@ -298,9 +312,9 @@ fn status(ctx: &Ctx) -> Result<(), CliError> {
                         "patient": r["label"].as_str().unwrap_or(r["id"].as_str().unwrap_or_default()),
                         "organization": r["organization_name"],
                         "relationship": r["relationship"],
-                        "usable": r.pointer("/session/authenticated").cloned().unwrap_or(false.into()),
-                        "renewable": r.pointer("/session/renewable").cloned().unwrap_or(false.into()),
-                        "token_expires": r.pointer("/session/expires_at").cloned().unwrap_or_default(),
+                        "usable": usable(r),
+                        "renewable": r.pointer("/status/renewable").cloned().unwrap_or(false.into()),
+                        "token_expires": r.pointer("/status/expires_at").cloned().unwrap_or_default(),
                     })
                 })
                 .collect();

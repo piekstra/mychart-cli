@@ -12,7 +12,7 @@ use crate::fhir::{origin, Fhir};
 use crate::orgs;
 use crate::session::{now, Context, Live};
 use crate::stream::{
-    Header, RecordsWriter, SourceCli, StreamOrganization, StreamPatient, FHIR_VERSION,
+    Header, RecordsWriter, SourceCli, StreamOrganization, StreamPatient, Trailer, FHIR_VERSION,
     STREAM_SCHEMA,
 };
 
@@ -30,7 +30,12 @@ pub fn synthetic(c: &Context) -> bool {
         })
 }
 
-fn validate(args: &ExportArgs) -> Result<(), CliError> {
+fn validate(args: &ExportArgs, json: bool) -> Result<(), CliError> {
+    if args.ndjson && json {
+        return Err(CliError::Usage(
+            "--ndjson is the output; leave out --json (it is for -o <DIR>, which prints records-export/v1)".into(),
+        ));
+    }
     if let Some(d) = &args.since {
         pk_cli_core::dates::parse_iso(d)?;
     }
@@ -60,15 +65,32 @@ pub fn header(c: &Context, since: Option<&str>) -> Header {
             organization: Some(c.organization.clone()),
             label: c.label.clone(),
             relationship: c.relationship.clone(),
+            kind: Some("patient".into()),
+            fhir_user: c.fhir_user.clone(),
         },
         since: since.map(str::to_string),
         pulled_at: rfc3339(now()),
-        fhir_version: Some(FHIR_VERSION.into()),
+        fhir_version: FHIR_VERSION.into(),
     }
 }
 
+/// `records-export/v1`: `{schema, path, bytes, complete, counts, skipped?}`.
+pub fn export_payload(path: &std::path::Path, bytes: u64, trailer: &Trailer) -> serde_json::Value {
+    let mut payload = json!({
+        "schema": "records-export/v1",
+        "path": path.display().to_string(),
+        "bytes": bytes,
+        "complete": trailer.complete,
+        "counts": trailer.counts,
+    });
+    if !trailer.skipped.is_empty() {
+        payload["skipped"] = json!(trailer.skipped);
+    }
+    payload
+}
+
 fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
-    validate(args)?;
+    validate(args, ctx.json())?;
     let c = ctx.signed_in(&args.who)?;
     if args.output.is_some() && !synthetic(&c) {
         return Err(CliError::Usage(format!(
@@ -121,13 +143,7 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
             let result = export::run(&fhir, &mut w, &c.id, since, &note);
             let trailer = w.finish(rfc3339(now()), result.as_ref().err())?;
             crate::fsutil::write_private(&path, &buf)?;
-            let payload = json!({
-                "schema": "records-export/v1",
-                "path": path.display().to_string(),
-                "counts": trailer.counts,
-                "skipped": trailer.skipped,
-                "complete": trailer.complete,
-            });
+            let payload = export_payload(&path, buf.len() as u64, &trailer);
             if ctx.json() {
                 output::json(&payload);
             } else {
@@ -150,5 +166,63 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::PatientArgs;
+    use crate::stream::{Skip, END_SCHEMA};
+
+    fn args(ndjson: bool, output: Option<&str>) -> ExportArgs {
+        ExportArgs {
+            who: PatientArgs::default(),
+            since: None,
+            ndjson,
+            output: output.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn the_stream_is_the_output_so_json_is_refused_with_it() {
+        let e = validate(&args(true, None), true).unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert!(validate(&args(true, None), false).is_ok());
+        assert!(validate(&args(false, Some("out")), true).is_ok());
+        assert_eq!(
+            validate(&args(false, None), false).unwrap_err().exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_export_document_carries_bytes_and_skips_only_when_there_are_any() {
+        let mut trailer = Trailer {
+            schema: END_SCHEMA.into(),
+            complete: true,
+            counts: [("Patient".to_string(), 1u64)].into_iter().collect(),
+            skipped: Vec::new(),
+            finished_at: Some("2026-01-01T00:00:00Z".into()),
+            error: None,
+        };
+        let path = std::path::Path::new("/tmp/out/records.ndjson");
+        let v = export_payload(path, 1234, &trailer);
+        assert_eq!(v["schema"], "records-export/v1");
+        assert_eq!(v["path"], "/tmp/out/records.ndjson");
+        assert_eq!(v["bytes"], 1234);
+        assert_eq!(v["complete"], true);
+        assert_eq!(v["counts"]["Patient"], 1);
+        assert!(v.get("skipped").is_none(), "{v}");
+
+        trailer.skipped.push(Skip {
+            resource_type: Some("Media".into()),
+            id: None,
+            search: Some("Media".into()),
+            reason: "HTTP 403".into(),
+            code: "forbidden".into(),
+        });
+        let v = export_payload(path, 1234, &trailer);
+        assert_eq!(v["skipped"][0]["code"], "forbidden");
     }
 }

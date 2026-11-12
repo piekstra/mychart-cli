@@ -209,7 +209,10 @@ range requests, so a failed download starts over.
 - **`aud` is required** ("Starting in the May 2023 version of Epic, this
   parameter will be required"). mychart sends the directory's address
   untouched: the directory spells some hosts in capitals (`FHIR.KP.ORG`) and
-  some bases with a trailing slash.
+  some bases with a trailing slash. The `aud` stays that untouched spelling;
+  only FHIR requests, and the `fhir_base` that `orgs`, `patients` and the
+  records stream report, use the base with its scheme and host lower-cased
+  and the trailing slash removed.
 - **PKCE is S256 only**: "Currently, only the S256 method is supported."
 - **Standalone launch is GET**: "POST requests are supported for EHR launches
   in Epic version November 2020 and later, and are not currently supported

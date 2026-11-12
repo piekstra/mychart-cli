@@ -3,7 +3,7 @@
 use pk_cli_core::{output, CliError};
 use serde_json::{json, Value};
 
-use super::auth::{patient_dto, stored};
+use super::auth::{patient_dto, stored, usable};
 use super::Ctx;
 use crate::cli::PatientsCmd;
 
@@ -14,7 +14,7 @@ pub fn run(ctx: &Ctx, cmd: &PatientsCmd) -> Result<(), CliError> {
         let session = if *status { stored(ctx, &c)? } else { None };
         let mut v = patient_dto(&c, session.as_ref());
         if *status && session.is_none() {
-            v["session"] = json!({ "authenticated": false });
+            v["status"] = json!({ "authenticated": false });
         }
         items.push(v);
     }
@@ -29,10 +29,7 @@ pub fn run(ctx: &Ctx, cmd: &PatientsCmd) -> Result<(), CliError> {
         );
         if *status {
             for (row, item) in view.iter_mut().zip(&items) {
-                row["usable"] = item
-                    .pointer("/session/authenticated")
-                    .cloned()
-                    .unwrap_or(false.into());
+                row["usable"] = usable(item).into();
             }
         }
         output::table(&view);

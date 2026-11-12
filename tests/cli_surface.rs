@@ -152,8 +152,14 @@ fn nothing_signed_in_reads_as_such() {
     assert_eq!(v["schema"], "patient-list/v1");
     assert_eq!(v["items"], serde_json::json!([]));
 
+    mychart(&home)
+        .args(["records", "export", "--ndjson"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("auth login"));
     for args in [
-        vec!["records", "export", "--ndjson", "--json"],
+        vec!["records", "export", "-o", "x", "--json"],
         vec!["documents", "list", "--json"],
         vec!["api", "GET", "Patient/x", "--json"],
     ] {
@@ -185,6 +191,7 @@ fn bad_arguments_are_refused_before_anything_else() {
             2,
         ),
         (vec!["records", "export", "--ndjson", "-o", "x"], 2),
+        (vec!["records", "export", "--ndjson", "--json"], 2),
         (vec!["api", "POST", "Patient"], 2),
         (vec!["api", "DELETE", "Patient/x"], 2),
         (

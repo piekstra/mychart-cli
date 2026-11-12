@@ -223,11 +223,23 @@ struct ManagingOrganization {
     display: Option<String>,
 }
 
-/// A FHIR base for joining paths: trailing slashes removed. The directory
-/// spells some hosts in capitals (`FHIR.KP.ORG`); the case is kept. The
-/// untouched spelling is `Org::address`, the `aud`.
+/// A FHIR base for joining paths and for the profile's `fhir_base`: scheme
+/// and host lower case, trailing slashes removed, the path untouched (as
+/// `pk_med_fhir::normalize_base`). The directory spells some hosts in
+/// capitals (`FHIR.KP.ORG`); its untouched spelling is `Org::address`, the
+/// `aud`.
 pub fn normalize_base(url: &str) -> String {
-    url.trim().trim_end_matches('/').to_string()
+    let url = url.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(split);
+    format!(
+        "{}://{}{path}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    )
 }
 
 /// Build the index from the bundle's text.
@@ -465,6 +477,23 @@ pub fn search<'a>(orgs: &'a [Org], text: &str) -> Vec<(&'a Org, Option<&'a str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_is_lower_cased_in_scheme_and_host_only() {
+        assert_eq!(
+            normalize_base(" HTTPS://FHIR.Example.ORG/Api/FHIR/R4/ "),
+            "https://fhir.example.org/Api/FHIR/R4"
+        );
+        assert_eq!(
+            normalize_base("http://127.0.0.1:9481/api/FHIR/R4"),
+            "http://127.0.0.1:9481/api/FHIR/R4"
+        );
+        assert_eq!(
+            normalize_base("https://FHIR.Example.ORG?Q=X"),
+            "https://fhir.example.org?Q=X"
+        );
+        assert_eq!(normalize_base("not a url/"), "not a url");
+    }
 
     fn fixture() -> String {
         std::fs::read_to_string(format!(

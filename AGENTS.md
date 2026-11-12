@@ -63,8 +63,12 @@ Medical records are the most sensitive data a household has.
 ## Conventions
 
 - `--json` on every command, one schema-tagged document on stdout. `records
-  export --ndjson` writes the stream instead, and a failure after the header
-  ends it with an incomplete trailer and the exit code.
+  export --ndjson` writes the stream instead, so `--json` with it is a usage
+  error (exit 2, health-records/v1 §1.1); a failure after the header ends the
+  stream with an incomplete trailer and the exit code.
+- The DTOs are `pk-med-records`' (medical-common `DESIGN.md` §1): a
+  `PatientContext`'s `session` is the Keychain account, never its content,
+  and `records-export/v1` carries `skipped` only when something was skipped.
 - Arguments are checked before the Keychain or the network.
 - Read-only: `api` takes GET and nothing else.
 - A token goes only to the organization's own origin: absolute paths and
