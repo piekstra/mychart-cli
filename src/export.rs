@@ -16,7 +16,7 @@ use pk_cli_core::CliError;
 use serde_json::Value;
 
 use crate::fhir::{Failure, Fhir, RawResource};
-use crate::stream::{RecordsWriter, Skip};
+use pk_med_records::{RecordsWriter, Skip};
 
 /// The searches, as (resource type, extra parameters, whether `--since`
 /// narrows it by `date`). The categories are the ones Epic's
@@ -122,6 +122,21 @@ fn describe(resource_type: &str, params: &[(String, String)]) -> String {
     }
 }
 
+/// The types `--since` leaves unbounded, for the header's
+/// `since_unbounded`: the Patient, every type with a search that carries no
+/// date, and the types read by reference.
+pub fn since_unbounded() -> Vec<String> {
+    let mut types: BTreeSet<&str> = BTreeSet::from(["Patient"]);
+    types.extend(
+        SEARCHES
+            .iter()
+            .filter(|(_, _, dated)| !dated)
+            .map(|(t, _, _)| *t),
+    );
+    types.extend(REFERENCED.iter().copied());
+    types.into_iter().map(str::to_string).collect()
+}
+
 /// `Binary/<id>` for an attachment URL on this server, relative or absolute.
 pub fn binary_id(url: &str) -> Option<String> {
     let tail = url
@@ -196,7 +211,7 @@ pub fn run<T: Transport, W: std::io::Write>(
     let mut tried_binaries = HashSet::new();
     match fhir.read(&format!("Patient/{patient}")) {
         Ok(p) => {
-            if let Some(v) = p.value() {
+            if let Ok(v) = p.value() {
                 // generalPractitioner, managingOrganization.
                 references(&v, &mut refs);
             }
@@ -213,7 +228,7 @@ pub fn run<T: Transport, W: std::io::Write>(
         let search = describe(resource_type, &p);
         let mut n = 0usize;
         let result = fhir.search_each(resource_type, &p, |r| {
-            let value = r.value();
+            let value = r.value().ok();
             // A resource another search already wrote has had its files
             // fetched after it.
             if !w.resource(&r)? {
@@ -321,11 +336,13 @@ fn binaries<T: Transport, W: std::io::Write>(
         }
         match fhir.binary(&url) {
             Ok(b) => {
+                // A Binary without an id is written with the one its
+                // attachment URL names. A Binary holds no decimal, so the
+                // round trip through a Value changes nothing else.
                 let b = if b.id.is_empty() {
-                    RawResource {
-                        id: id.clone(),
-                        ..b
-                    }
+                    let mut v = b.value()?;
+                    v["id"] = id.clone().into();
+                    RawResource::from_value(&v)?
                 } else {
                     b
                 };
@@ -343,6 +360,25 @@ fn binaries<T: Transport, W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unbounded_types_are_the_undated_searches_and_the_reads() {
+        let types = since_unbounded();
+        let mut sorted = types.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(types, sorted, "sorted, once each");
+        assert!(types.contains(&"Patient".to_string()));
+        for (t, _, dated) in SEARCHES {
+            // A type searched both ways is still unbounded by its undated search.
+            let undated = SEARCHES.iter().any(|(u, _, d)| u == t && !d);
+            assert_eq!(types.contains(&t.to_string()), undated || !dated, "{t}");
+        }
+        for t in REFERENCED {
+            assert!(types.contains(&t.to_string()), "{t}");
+        }
+        assert!(!types.contains(&"Binary".to_string()));
+    }
 
     #[test]
     fn binary_ids_come_from_relative_and_absolute_urls() {

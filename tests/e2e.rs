@@ -308,10 +308,10 @@ fn export_stream(
     let fhir = mychart::fhir::Fhir::new(&t, &live.fhir_base(), &live);
     let mut buf = Vec::new();
     let mut w =
-        mychart::stream::RecordsWriter::new(&mut buf, &commands::records::header(&c, since))
+        pk_med_records::RecordsWriter::start(&mut buf, &commands::records::header(&c, since))
             .unwrap();
     mychart::export::run(&fhir, &mut w, &c.id, since, &|_| {}).unwrap();
-    w.finish("2026-01-01T00:00:00Z".into(), None).unwrap();
+    w.finish("2026-01-01T00:00:00Z", None).unwrap();
     let text = String::from_utf8(buf).unwrap();
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     let values = lines
@@ -339,6 +339,7 @@ fn an_export_is_one_records_stream_with_documents_after_their_references() {
     assert_eq!(header["patient"]["relationship"], "self");
     assert_eq!(header["fhir_version"], "4.0.1");
     assert!(header.get("since").is_none());
+    assert!(header.get("since_unbounded").is_none(), "{header}");
 
     let trailer = values.last().unwrap();
     assert_eq!(trailer["schema"], "records-stream-end/v1");
@@ -415,6 +416,24 @@ fn since_narrows_dated_searches() {
     login(&ctx, "adult1");
     let (values, _) = export_stream(&ctx, SELF_PATIENT, Some("2026-02-01"));
     assert_eq!(values[0]["since"], "2026-02-01");
+    let unbounded: Vec<&str> = values[0]["since_unbounded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for t in [
+        "Patient",
+        "AllergyIntolerance",
+        "Condition",
+        "Medication",
+        "Practitioner",
+    ] {
+        assert!(unbounded.contains(&t), "{t} in {unbounded:?}");
+    }
+    for t in ["Observation", "DocumentReference", "Binary", "Encounter"] {
+        assert!(!unbounded.contains(&t), "{t} in {unbounded:?}");
+    }
     let trailer = values.last().unwrap();
     assert_eq!(trailer["counts"]["Observation"], 2);
     assert_eq!(trailer["counts"]["AllergyIntolerance"], 1);

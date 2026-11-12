@@ -23,10 +23,12 @@ on this repository. Please do not open a public issue.
   only to this machine): the origin is the one the Keychain's sign-in was
   made at, not the plain-file patient index, and paths, next links and
   attachment URLs on another host are refused or skipped without the token.
-- **Files** are written through cli-common's owner-only writer: a temp file
-  created exclusively (`O_EXCL`, `0600`) and renamed over the target, so a
-  file or symbolic link another account plants never receives the records;
-  at worst the write fails.
+- **Files** are created new under a temporary name (`O_EXCL`, `0600`, which
+  never follows a symbolic link) and renamed over the target, so a file or
+  symbolic link another account plants never receives the records; at worst
+  the write fails. Saved documents go through cli-common's owner-only
+  writer, `records.ndjson` through pk-med-records' `create_export_file`,
+  which refuses a symbolic link at the target outright.
 - **Renewals** are serialized across processes by a refresh lock under
   `~/.config/mychart/`, so two processes never renew one sign-in at once.
 - **Records** go to stdout (`--ndjson`) or, for Epic's sandbox and local

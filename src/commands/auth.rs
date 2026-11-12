@@ -261,21 +261,9 @@ fn verify<T: Transport>(t: &T, s: &Session) -> bool {
 /// holding the sign-in, never its content; a stored session's state goes
 /// in the extra `status` object.
 pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
-    let mut v = json!({
-        "id": c.id,
-        "organization": c.organization,
-        "kind": "patient",
-        "session": c.account(),
-    });
-    if let Some(l) = &c.label {
-        v["label"] = l.clone().into();
-    }
-    if let Some(r) = &c.relationship {
-        v["relationship"] = r.clone().into();
-    }
-    if let Some(u) = &c.fhir_user {
-        v["fhir_user"] = u.clone().into();
-    }
+    let mut pc = c.patient_context();
+    pc.session = Some(c.account());
+    let mut v = serde_json::to_value(pc).unwrap_or_default();
     v["organization_name"] = c.organization_name.clone().into();
     v["fhir_base"] = c.fhir_base.clone().into();
     v["signed_in_at"] = c.signed_in_at.clone().into();

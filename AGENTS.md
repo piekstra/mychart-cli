@@ -18,15 +18,21 @@ the `pk-cli-*` crates from [cli-common](https://github.com/piekstra/cli-common).
 | `src/key.rs` | the per-install RSA key and its RS384 client assertion |
 | `src/session.rs` | the stored sign-in (`Session`), the patient index (`contexts.json`), `pick`, renewal under the refresh lock (`access_token`, `Live`) |
 | `src/vault.rs` | the Keychain behind a trait, so tests use memory |
-| `src/fhir.rs` | the read client: reads, paged searches, `Binary`, status to skip or error |
-| `src/export.rs` | Epic's search plan and the export order |
-| `src/stream.rs` | the `records-stream/v1` writer |
+| `src/fhir.rs` | the request layer: reads, paged searches, `Binary`, retries, status to skip or error |
+| `src/export.rs` | Epic's search plan, the export order, and the types `--since` leaves unbounded |
 | `tests/support/mock_epic.rs` | a mock Epic organization on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | Epic's behaviour and traps, quoted; read before changing auth or export |
 
-`src/smart.rs`, `src/fhir.rs` and `src/stream.rs` stand in for
-medical-common's `pk-med-smart`, `pk-med-fhir` and `pk-med-records`; each
-goes when its crate is tagged and pinned, with no change to the stream.
+The stream (`RecordsWriter`, `Header`, `Skip`, the trailer), the DTOs,
+`records-export/v1` and the export file are medical-common's
+`pk-med-records`; `RawResource`, `normalize_base` and `describe_json_error`
+are its `pk-med-fhir` (v0.1.0, pinned with cli-common v0.31.0, the tag it
+builds on). `src/smart.rs` and the request layer in `src/fhir.rs` stand in
+for `pk-med-smart` and `pk_med_fhir::FhirClient` until medical-common
+v0.2.0, which adds what an Epic export needs from the client: a token
+source that renews mid-export, a network failure told from a 5xx, retry
+notes and pages read around an unreadable entry. Move every `pk-cli-*` and
+`pk-med-*` together, so the build holds one copy of each crate.
 
 ## Medical data
 
