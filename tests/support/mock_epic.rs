@@ -71,12 +71,14 @@ pub struct State {
     pub refuse: Vec<(String, u16)>,
     pub page_size: usize,
     counter: u64,
+    /// Per process, so a token from an earlier mock is unknown to this one.
+    salt: u32,
 }
 
 impl State {
     fn next(&mut self, prefix: &str) -> String {
         self.counter += 1;
-        format!("{prefix}{:016}", self.counter)
+        format!("{prefix}{:08x}{:016}", self.salt, self.counter)
     }
 }
 
@@ -110,6 +112,10 @@ impl MockEpic {
             ],
             page_size: 2,
             counter: 0,
+            salt: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
