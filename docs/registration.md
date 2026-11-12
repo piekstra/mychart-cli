@@ -13,9 +13,25 @@ confidential, so do not publish yours.
 ## 1. Create a developer account
 
 1. Open <https://fhir.epic.com> and choose **Sign Up**.
-2. Register as an individual developer with your own email address, and
-   confirm the address from the email Epic sends.
-3. Accept the open.epic Terms of Use when asked.
+2. Fill in the sign-up page as an individual: a household registering its
+   own app is not a company and not a healthcare organization. Fields
+   marked `*` are required.
+
+   | Section | Field | What to enter |
+   | --- | --- | --- |
+   | User Information | First Name\*, Last Name\* | Your own. |
+   | Business Information | Company Email\* | Your own email address. |
+   | | Phone | Optional: your own, or empty. |
+   | | Company Name\* | Your own name. Epic's public pages do not say where this name appears; assume a patient signing in may see it. |
+   | | Website | Optional. Choose `https://` and enter the repository of the mychart you run: `github.com/piekstra/mychart-cli`. |
+   | | Country\*, Address\*, City\*, State\*, Zip Code\* | Your own address, for Epic. |
+
+   Complete the reCAPTCHA and choose **Submit**. The page asks nothing
+   about funding or data sharing; the app's questionnaire does, in step 2.
+3. Confirm the address from the email Epic sends.
+4. Accept the open.epic Terms of Use when asked. If Epic shows the account
+   as awaiting review, wait for its email before signing in to create the
+   app.
 
 ## 2. Create the app
 
@@ -25,7 +41,8 @@ the form:
 | Field | Value |
 | --- | --- |
 | Application Name | A name your household recognises, for example `Household Records (mychart-cli)`. MyChart shows it on the sign-in consent page ("Which patient do you want <application name> to be able to link to?"). |
-| Application Audience | **Patients** ("For patients and their caretakers authenticating with MyChart") |
+| Application Audience | **Patients** ("For patients and their caretakers authenticating with MyChart"; the others are Clinicians or Administrative Users, and Backend Systems) |
+| Public Documentation URL | Choose `https://` (the default is `http://`) and enter `github.com/piekstra/mychart-cli`: its README says what the app reads, where records go, that it only reads, and how to end its access. |
 | Incoming APIs | Every API in the [list below](#apis-to-select). Select nothing else: an ExplanationOfBenefit, ImagingStudy or any other API outside Epic's USCDI v3 list ends automatic distribution to every organization. |
 | Default FHIR Version | **R4** |
 | Redirect URIs | `http://127.0.0.1:7468/callback` and `http://localhost:7468/callback` (exact; Epic compares them character for character) |
