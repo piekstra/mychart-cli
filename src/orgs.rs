@@ -111,7 +111,8 @@ impl Org {
 
     /// `organization()` and, from a search, what matched.
     pub fn dto(&self, matched: Option<&str>) -> serde_json::Value {
-        let mut v = serde_json::to_value(self.organization()).unwrap_or_default();
+        // Strings, optional strings and a list of them: nothing to fail on.
+        let mut v = serde_json::to_value(self.organization()).expect("an Organization serializes");
         if let Some(m) = matched {
             v["matched"] = m.into();
         }

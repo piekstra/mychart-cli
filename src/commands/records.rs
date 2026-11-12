@@ -106,20 +106,20 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
             }
         }
         Some(dir) => {
-            let (path, file) = pk_med_records::create_export_file(dir)?;
-            let mut out = std::io::BufWriter::new(file);
+            // The previous export is replaced only by a finished stream, its
+            // trailer written and synced; one cut short leaves it whole.
+            let mut staged = crate::fsutil::Staged::create(&dir.join(pk_med_records::EXPORT_FILE))?;
+            let mut out = std::io::BufWriter::new(staged.file());
             let mut w = RecordsWriter::start(&mut out, &head)?;
             let result = export::run(&fhir, &mut w, &c.id, since, &note);
             let finished = w.finish(rfc3339(now()), result.as_ref().err())?;
-            // On disk before the summary says it was written.
-            out.into_inner()
-                .map_err(|e| e.into_error())
-                .and_then(|f| f.sync_all())
-                .map_err(|e| CliError::Other(format!("writing {}: {e}", path.display())))?;
+            drop(out);
+            let path = staged.path().to_path_buf();
+            staged.commit()?;
             let payload = RecordsExport::new(path.display().to_string(), &finished);
             let trailer = &finished.trailer;
             if ctx.json() {
-                output::json(&serde_json::to_value(&payload).unwrap_or_default());
+                output::json(&super::to_json(&payload)?);
             } else {
                 let n = trailer.total();
                 let _ = writeln!(

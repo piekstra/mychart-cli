@@ -310,7 +310,7 @@ fn download_all(
     }
     let batch = DownloadBatch::new(dir.display().to_string(), saved).with_skipped(skipped);
     if ctx.json() {
-        output::json(&serde_json::to_value(&batch).unwrap_or_default());
+        output::json(&super::to_json(&batch)?);
     } else {
         println!(
             "saved {} documents to {} ({} skipped)",

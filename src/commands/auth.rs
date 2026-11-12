@@ -263,7 +263,8 @@ fn verify<T: Transport>(t: &T, s: &Session) -> bool {
 pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
     let mut pc = c.patient_context();
     pc.session = Some(c.account());
-    let mut v = serde_json::to_value(pc).unwrap_or_default();
+    // Strings and optional strings: nothing to fail on.
+    let mut v = serde_json::to_value(pc).expect("a PatientContext serializes");
     v["organization_name"] = c.organization_name.clone().into();
     v["fhir_base"] = c.fhir_base.clone().into();
     v["signed_in_at"] = c.signed_in_at.clone().into();
