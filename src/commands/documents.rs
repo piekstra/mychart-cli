@@ -157,11 +157,22 @@ pub fn list(
     let c = ctx.signed_in(who)?;
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &c.fhir_base, &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    list_in(ctx, &fhir, &c.id, range)
+}
+
+/// The patient's documents in `range`, newest first, through one sign-in.
+fn list_in<T: pk_cli_core::transport::Transport>(
+    ctx: &Ctx,
+    fhir: &Fhir<'_, T>,
+    patient: &str,
+    range: &pk_cli_documents::RangeArgs,
+) -> Result<Vec<Listed>, CliError> {
     let mut out: Vec<Listed> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for extra in [&[("category", "clinical-note")][..], &[][..]] {
-        let mut params = vec![("patient".to_string(), c.id.clone())];
+        let mut params = vec![("patient".to_string(), patient.to_string())];
         params.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let r = fhir.search_each("DocumentReference", &params, |r| {
             if seen.insert(r.id.clone()) {
@@ -172,6 +183,10 @@ pub fn list(
             Ok(())
         });
         match r {
+            Ok(summary) if summary.malformed > 0 => ctx.note(format!(
+                "warning: {} DocumentReference entries were not FHIR resources",
+                summary.malformed
+            )),
             Ok(_) => {}
             Err(Failure::Skip { code, reason }) => ctx.note(format!(
                 "warning: DocumentReference search {extra:?} refused ({code}: {reason})"
@@ -205,8 +220,9 @@ fn fetch<T: pk_cli_core::transport::Transport>(
             reason: "the Binary carries no data".into(),
         });
     };
+    let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
+        .decode(compact.as_bytes())
         .map_err(|e| Failure::Skip {
             code: "verify_failed",
             reason: format!("the Binary's data is not base64: {e}"),
@@ -234,17 +250,18 @@ fn target(output: &Path, d: &Listed) -> PathBuf {
 
 fn download_one(ctx: &Ctx, who: &PatientArgs, id: &str, output: &Path) -> Result<(), CliError> {
     let id = id.strip_suffix("#1").unwrap_or(id);
-    let docs = list(ctx, who, &pk_cli_documents::RangeArgs::default())?;
+    let c = ctx.signed_in(who)?;
+    let t = transport()?;
+    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let docs = list_in(ctx, &fhir, &c.id, &pk_cli_documents::RangeArgs::default())?;
     let Some(d) = docs.iter().find(|d| d.document.id == id) else {
         return Err(
             CliError::NotFound(format!("no document `{id}` for this patient"))
                 .with_remedy("list them with `mychart documents list`"),
         );
     };
-    let c = ctx.signed_in(who)?;
-    let t = transport()?;
-    let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &c.fhir_base, &live);
     let bytes = fetch(&fhir, d).map_err(Failure::into_error)?;
     let path = target(output, d);
     crate::fsutil::write_private(&path, &bytes)?;
@@ -266,12 +283,13 @@ fn download_all(
             dir.display()
         )));
     }
-    crate::fsutil::create_private_dir(dir)?;
-    let docs = list(ctx, who, range)?;
     let c = ctx.signed_in(who)?;
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &c.fhir_base, &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let docs = list_in(ctx, &fhir, &c.id, range)?;
+    crate::fsutil::create_private_dir(dir)?;
     let (mut saved, mut skipped) = (Vec::new(), Vec::new());
     for d in &docs {
         match fetch(&fhir, d) {

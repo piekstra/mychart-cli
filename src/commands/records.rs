@@ -103,19 +103,21 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
     }
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &c.fhir_base, &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
+    let since = args.since.as_deref();
+    let mut head = header(&c, since);
+    head.organization.fhir_base = fhir.base().to_string();
     let note = |line: String| {
         if ctx.common.verbose {
             ctx.note(line)
         }
     };
-    let since = args.since.as_deref();
 
     match &args.output {
         None => {
             let stdout = std::io::stdout();
-            let mut w =
-                RecordsWriter::new(std::io::BufWriter::new(stdout.lock()), &header(&c, since))?;
+            let mut w = RecordsWriter::new(std::io::BufWriter::new(stdout.lock()), &head)?;
             let result = export::run(&fhir, &mut w, &c.id, since, &note);
             let counts: u64 = w.counts().values().sum();
             let trailer = w.finish(rfc3339(now()), result.as_ref().err())?;
@@ -139,7 +141,7 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
             crate::fsutil::create_private_dir(dir)?;
             let path = dir.join("records.ndjson");
             let mut buf = Vec::new();
-            let mut w = RecordsWriter::new(&mut buf, &header(&c, since))?;
+            let mut w = RecordsWriter::new(&mut buf, &head)?;
             let result = export::run(&fhir, &mut w, &c.id, since, &note);
             let trailer = w.finish(rfc3339(now()), result.as_ref().err())?;
             crate::fsutil::write_private(&path, &buf)?;

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use pk_cli_auth::{AuthMethod, AuthStatus};
-use pk_cli_core::transport::{HttpRequest, Transport};
-use pk_cli_core::{block_on, output, CliError};
+use pk_cli_core::transport::Transport;
+use pk_cli_core::{output, CliError};
 use serde_json::{json, Value};
 
 use super::{orgs as orgs_cmd, rfc3339, transport, Ctx, BIN};
@@ -74,6 +74,9 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
              `{BIN} config set {key_name} <ID>`"
         ))
     })?;
+    // Discovery's answer names the endpoints the sign-in goes to, so it too
+    // must come over https (or from this machine).
+    pk_cli_core::transport::require_secure_url(&org.fhir_base)?;
     let lock = &ctx.lock;
     lock.before_signin()?;
 
@@ -115,6 +118,11 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
                 .into(),
         )
     })?;
+    if !is_fhir_id(&patient) {
+        return Err(CliError::Upstream(
+            "the organization granted access to a patient id that is not a FHIR id".into(),
+        ));
+    }
     let fhir_user = granted.id_token.as_deref().and_then(smart::fhir_user);
     let at = now();
     let mut session = Session {
@@ -146,10 +154,22 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
                 &client_id,
                 &key,
             )?;
-            let renewed = smart::jwt_bearer_grant(&t, &endpoints.token, &dynamic, &key, now())?;
-            session.apply(&renewed, now());
-            session.dynamic_client_id = Some(dynamic);
+            // The registration used up the one-time initial token, so from
+            // here the dynamic client and its key are the sign-in: kept even
+            // when the first grant fails, which the next command retries.
             session.private_key = Some(key.to_stored()?);
+            session.dynamic_client_id = Some(dynamic.clone());
+            match smart::jwt_bearer_grant(&t, &endpoints.token, &dynamic, &key, now()) {
+                Ok(renewed) => session.apply(&renewed, now()),
+                Err(e) => {
+                    session.expires_at = 0;
+                    ctx.note(format!(
+                        "warning: this install's first token request failed ({}); the sign-in \
+                         is stored and the next command asks again",
+                        e.message()
+                    ));
+                }
+            }
         }
         (None, true) if session.refresh_token.is_none() => ctx.note(format!(
             "warning: {} offers this app no dynamic client registration; this sign-in lasts until {}",
@@ -210,26 +230,31 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// One read of the patient's own record, to prove the session works. Only
-/// the status is looked at.
-fn verify<T: Transport>(t: &T, s: &Session) -> bool {
-    let url = format!(
-        "{}/Patient/{}",
-        s.fhir_base.trim_end_matches('/'),
-        s.patient
-    );
-    let req = HttpRequest::get(url)
-        .header("Accept", "application/fhir+json")
-        .header("Authorization", format!("Bearer {}", s.access_token))
-        .user_agent(BIN, env!("CARGO_PKG_VERSION"));
-    match block_on(t.send(req)) {
-        Ok(resp) => {
-            resp.is_success()
-                && serde_json::from_str::<Value>(&resp.body)
-                    .is_ok_and(|v| v["resourceType"] == "Patient")
-        }
-        Err(_) => false,
+/// A FHIR `id`: 1 to 64 of `A-Z a-z 0-9 - .`. The patient id goes into
+/// request paths and the Keychain account's name.
+fn is_fhir_id(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+/// The token just granted, as a [`Bearer`](crate::fhir::Bearer).
+struct Granted<'a>(&'a str);
+
+impl crate::fhir::Bearer for Granted<'_> {
+    fn token(&self) -> Result<String, CliError> {
+        Ok(self.0.to_string())
     }
+}
+
+/// One read of the patient's own record, to prove the session works,
+/// through the same origin and https checks as every other request. Only
+/// the resource type is looked at.
+fn verify<T: Transport>(t: &T, s: &Session) -> bool {
+    let bearer = Granted(&s.access_token);
+    crate::fhir::Fhir::new(t, &s.fhir_base, &bearer)
+        .read(&format!("Patient/{}", s.patient))
+        .is_ok_and(|r| r.resource_type == "Patient")
 }
 
 /// The profile's `PatientContext` DTO. `session` names the Keychain item
@@ -381,6 +406,15 @@ fn logout(ctx: &Ctx, args: &LogoutArgs) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_patient_id_must_be_a_fhir_id() {
+        assert!(super::is_fhir_id("eq081-VQEgP8drUUqCWzHfw3"));
+        assert!(super::is_fhir_id("a.b-1"));
+        for bad in ["", "x/../y", "x?y", "x y", &"a".repeat(65)] {
+            assert!(!super::is_fhir_id(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     #[test]

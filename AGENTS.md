@@ -71,8 +71,13 @@ Medical records are the most sensitive data a household has.
   and `records-export/v1` carries `skipped` only when something was skipped.
 - Arguments are checked before the Keychain or the network.
 - Read-only: `api` takes GET and nothing else.
-- A token goes only to the organization's own origin: absolute paths and
-  next links are checked (`fhir::origin`).
+- A token goes only to the organization's own origin, the one the Keychain
+  session records (`Live::fhir_base`), never the index's: absolute paths,
+  next links and attachment URLs are checked (`fhir::origin`).
+- An export stops only when the sign-in, the network or the output fails.
+  Anything else (a refusal, an answer that is not FHIR, a file on another
+  server) is a skip, and a Binary is fetched once, right after the first
+  resource that names it.
 - Every binary-producing `make` target signs with the stable
   `pk-cli-codesign` identity.
 
