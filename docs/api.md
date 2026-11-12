@@ -236,14 +236,66 @@ range requests, so a failed download starts over.
 
 ## Kaiser Permanente
 
-Kaiser's clinical records are Epic. The Brands bundle lists eight regional
-brands, each an `--org`: Colorado, Georgia, Hawaii, Mid-Atlantic, Northern
-California, Northwest and Southern California under
-`https://fhir.kp.org/service/ptnt_care/EpicEdiFhirRoutingSvc/v2014/esb-envlbl/<n>/api/FHIR/R4`
-(`n` = 140, 200, 130, 170, 326, 190, 226), and Washington at
-`https://fhir.kp.org/Interconnect-FHIR-PRD/api/FHIR/R4`. Their authorization
-server is elsewhere (`https://fhir.kp.org/KPPolarisPortal/esb-envlbl/<n>/oauth2`),
-which discovery finds. Kaiser's guide: "No approval (beyond the OAuth
-security flow) is needed for the open.epic API" and "All testing is done
-with Epic in their Testing Sandbox." The deprecated R4 bundle disagrees on
-two regions' numbers; mychart uses Brands.
+Kaiser's clinical records are Epic. Kaiser's developer portal
+(<https://developer.kp.org/#/apis>) lists its clinical API as "Other
+Interoperability": "For Clinical Data exchange Kaiser Permanente use Epic on
+FHIR." Its clinical developer guide (June 2023, linked from that entry):
+"No approval (beyond the OAuth security flow) is needed for the open.epic
+API" and "There is no testing with Kaiser. All testing is done with Epic in
+their Testing Sandbox." So each region is an `--org` of mychart, signed in
+separately.
+
+| Brand (Brands bundle id) | R4 base | Authorization server number |
+|---|---|---|
+| Kaiser Permanente - Colorado (478) | `.../esb-envlbl/140/api/FHIR/R4/` | 140 |
+| Kaiser Permanente - Georgia (237) | `.../esb-envlbl/200/api/FHIR/R4/` | 200 |
+| Kaiser Permanente - Hawaii (479) | `.../esb-envlbl/130/api/FHIR/R4/` | 130 |
+| Kaiser Permanente - Mid-Atlantic (480) | `https://FHIR.KP.ORG/.../esb-envlbl/170/api/FHIR/R4` | 170 |
+| Kaiser Permanente - Northern California (482) | `https://FHIR.KP.ORG/.../esb-envlbl/326/api/FHIR/R4/` | 326 |
+| Kaiser Permanente - Northwest (132) | `https://FHIR.KP.ORG/.../esb-envlbl/190/api/FHIR/R4/` | 190 |
+| Kaiser Permanente - Southern California (483) | `.../esb-envlbl/226/api/FHIR/R4/` | 226 |
+| Kaiser Permanente - Washington (439) | `https://fhir.kp.org/Interconnect-FHIR-PRD/api/FHIR/R4` | 750 |
+
+`...` is `https://fhir.kp.org/service/ptnt_care/EpicEdiFhirRoutingSvc/v2014`.
+The authorization server is
+`https://fhir.kp.org/KPPolarisPortal/esb-envlbl/<number>/oauth2`, off the
+base's path, which discovery finds; never derive it from the base. The
+deprecated R4 bundle still lists Southern California at 212 and Northern
+California at 312 plus a second entry ("Kaiser – NCAL - prod 326 (CIS)");
+those bases authorize at 226 and 326. mychart uses Brands.
+
+- **Discovery** at every base (read 2026-11-12) is identical apart from its
+  URLs: `client-public`, `context-standalone-patient`, `permission-offline`,
+  `permission-v1` and `-v2`, PKCE `S256`, and the `jwt-bearer` grant. The
+  CapabilityStatement's `implementation.url` is the `KPPolarisPortal` path,
+  not the base; requests and `aud` use the directory's base.
+- **Northwest and Washington are two organizations.** Northwest covers Oregon
+  and SW Washington; Washington is the former Group Health. A person with
+  records in both signs in to each.
+- **Coverage** comes through mychart: Kaiser's health plan runs in the same
+  Epic instance, and `Coverage` is on the USCDI v3 list. **Claims**
+  (`ExplanationOfBenefit`) do not: Kaiser's servers list EOB, but selecting
+  it in the app ends automatic distribution (section 1). Kaiser serves
+  claims from a separate health-plan Patient Access API at
+  `kpx-service-bus.kp.org`, which needs its own reviewed registration at
+  developer.kp.org; Kaiser: "The health plan API (Patient Access API) is
+  separate and distinct from the open.epic clinical data API", with separate
+  member consent. mychart does not call it.
+- **Proxy.** Kaiser's "Act for a Family Member" gives a parent kp.org access
+  to a dependent under 18 (the child's name, birth date and record number; a
+  security code mailed home, or set up in person). Whether the proxied child
+  then appears in the patient picker of a standalone launch at Kaiser shows
+  on the first proxy sign-in.
+- **Images.** Kaiser's servers list `ImagingStudy`, but the app does not
+  select it (section 5). No Kaiser API serves DICOM to a patient; studies
+  come by a release-of-information request to the region. Washington:
+  "Copies of digital images are available on CD", and a CD not handed to the
+  patient in person "will be encrypted". Northwest: an Imaging ROI request;
+  dental and eye images through a download portal (Nuance PowerShare) with a
+  DICOM download.
+- **Distribution is unverified.** Epic distributes a qualifying app's client
+  id unless an organization "has disabled auto-download functionality";
+  Kaiser does not say whether it has. Loading one region's authorize URL
+  with the production client id answers it without signing in: Kaiser's
+  sign-in page means the client is known, an OAuth error page means it is
+  not.
