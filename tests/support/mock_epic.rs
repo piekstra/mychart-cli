@@ -81,6 +81,12 @@ pub struct State {
 }
 
 impl State {
+    /// Forget every access token issued, as a server that revoked them
+    /// would; the registered clients stay.
+    pub fn forget_tokens(&mut self) {
+        self.tokens.clear();
+    }
+
     fn next(&mut self, prefix: &str) -> String {
         self.counter += 1;
         format!("{prefix}{:08x}{:016}", self.salt, self.counter)

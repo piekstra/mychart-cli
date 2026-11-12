@@ -17,7 +17,7 @@ use mychart::session::{self, Session};
 use mychart::vault::{self, MemoryVault};
 use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_config::ConfigStore;
-use pk_cli_core::CommonArgs;
+use pk_cli_core::{CliError, CommonArgs};
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -748,11 +748,101 @@ fn a_failed_first_grant_keeps_the_registered_install() {
         panic!("a refused grant returned a session")
     };
     assert_eq!(e.exit_code(), 3);
+    let refused = stored(&ctx, SELF_PATIENT);
+    assert!(refused.refused_at.is_some());
+    assert!(!refused.usable(session::now()));
 
+    // A refusal is not final: the next use tries the grant once more.
     mock.set(|st| st.refuse_jwt_bearer = false);
     let renewed = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
     assert!(renewed.is_fresh(session::now()));
+    assert!(stored(&ctx, SELF_PATIENT).refused_at.is_none());
     assert_eq!(mock.get(|st| st.registrations), 1);
+}
+
+#[test]
+fn a_revoked_token_is_renewed_once_and_the_export_goes_on() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let grants = mock.get(|st| st.jwt_bearer_grants);
+    mock.set(|st| st.forget_tokens());
+    let (values, _) = export_stream(&ctx, SELF_PATIENT, None);
+    let trailer = values.last().unwrap();
+    assert_eq!(trailer["complete"], true);
+    assert_eq!(trailer["counts"]["Patient"], 1);
+    assert_eq!(mock.get(|st| st.jwt_bearer_grants), grants + 1);
+    assert!(stored(&ctx, SELF_PATIENT).refused_at.is_none());
+}
+
+/// An export of `patient` that may fail: the error, if any.
+fn export_result(ctx: &Ctx, patient: &str) -> Result<(), CliError> {
+    let c = ctx
+        .contexts()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == patient)
+        .unwrap();
+    let t = commands::transport().unwrap();
+    let live = session::Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
+    let fhir = mychart::fhir::Fhir::new(&t, &live.fhir_base(), &live);
+    let mut buf = Vec::new();
+    let mut w =
+        pk_med_records::RecordsWriter::start(&mut buf, &commands::records::header(&c, None))
+            .unwrap();
+    mychart::export::run(&fhir, &mut w, &c.id, None, &|_| {})
+}
+
+#[test]
+fn a_refused_renewal_shows_in_status_and_its_token_is_not_sent_again() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    mock.set(|st| {
+        st.forget_tokens();
+        st.refuse_jwt_bearer = true;
+    });
+    let e = export_result(&ctx, SELF_PATIENT).unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+
+    let c = ctx.contexts().unwrap().remove(0);
+    let s = stored(&ctx, SELF_PATIENT);
+    assert!(s.refused_at.is_some());
+    let row = commands::auth::patient_dto(&c, Some(&s));
+    assert_eq!(row["status"]["authenticated"], false, "{row}");
+    assert!(row["status"]["refused_at"].is_string(), "{row}");
+
+    // The next export asks for a grant first (refused again, so none is
+    // counted) and sends no FHIR request.
+    let reads: usize = mock.get(|st| st.hits.values().sum());
+    let grants = mock.get(|st| st.jwt_bearer_grants);
+    let e = export_result(&ctx, SELF_PATIENT).unwrap_err();
+    assert_eq!(e.exit_code(), 3);
+    assert_eq!(mock.get(|st| st.hits.values().sum::<usize>()), reads);
+    assert_eq!(mock.get(|st| st.jwt_bearer_grants), grants);
+}
+
+#[test]
+fn a_401_to_a_just_renewed_token_ends_the_sign_in() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let grants = mock.get(|st| st.jwt_bearer_grants);
+    mock.set(|st| {
+        st.faults.push(mock_epic::Fault {
+            path: format!("Patient/{SELF_PATIENT}"),
+            status: 401,
+            body: "{}".into(),
+            times: 2,
+        })
+    });
+    let e = export_result(&ctx, SELF_PATIENT).unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    assert_eq!(mock.get(|st| st.jwt_bearer_grants), grants + 1);
+    assert!(stored(&ctx, SELF_PATIENT).refused_at.is_some());
 }
 
 #[test]
