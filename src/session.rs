@@ -25,6 +25,25 @@ pub use pk_med_smart::account;
 /// does not start an export that fails part way.
 pub const EXPIRY_SKEW_SECS: u64 = 120;
 
+/// How long an access token lasts when its token answer has no
+/// `expires_in`: an hour, as mychart 0.1 took it. Epic states one; a token
+/// with no stated end would otherwise never be renewed before a 401, and
+/// `expires_at` would have nothing to show.
+pub const UNSTATED_LIFETIME_SECS: u64 = 3600;
+
+/// When `tokens` stop working: as the organization said, or an hour after
+/// they were issued.
+pub fn expiry(tokens: &pk_cli_auth::oauth::TokenSet) -> u64 {
+    tokens
+        .expires_at
+        .unwrap_or_else(|| tokens.obtained_at.saturating_add(UNSTATED_LIFETIME_SECS))
+}
+
+/// [`expiry`] as RFC 3339: what `expires_at` shows.
+pub fn expires_at(tokens: &pk_cli_auth::oauth::TokenSet) -> String {
+    pk_cli_core::dates::fmt_rfc3339(expiry(tokens) as i64)
+}
+
 /// One row of the index: everything about a context but its secrets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Context {
@@ -278,7 +297,7 @@ fn explain(ctx: &Context, e: CliError) -> CliError {
     }
 }
 
-type Note = Arc<dyn Fn(&str) + Send + Sync>;
+pub type Note = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A signed-in context's bearer for a run of requests: renewed through the
 /// refresh lock when it falls due, so an export longer than the token's
@@ -322,12 +341,14 @@ fn put<V>(m: &Mutex<V>, value: V) {
 impl<T: Transport + Clone + Send + Sync + 'static> Live<T> {
     /// The context's session, renewed now if it is due. The token goes only
     /// to the server it was issued for, as the Keychain records it: the
-    /// index is a plain file anyone running as this user can edit.
+    /// index is a plain file anyone running as this user can edit. `note`
+    /// is where a renewal after a 401 is reported, so it is never silent.
     pub fn start(
         t: &T,
         vault: Arc<dyn Vault>,
         lock: &RefreshLock,
         context: &Context,
+        note: Option<Note>,
     ) -> Result<Self, CliError> {
         let sessions = Sessions::new(vault);
         let stored = load(&sessions, context)?;
@@ -350,21 +371,11 @@ impl<T: Transport + Clone + Send + Sync + 'static> Live<T> {
                 fhir_base: stored.fhir_base.clone(),
                 reissued: Mutex::new(None),
                 last_sent: Mutex::new(None),
-                note: None,
+                note,
             }),
         };
         live.fresh()?;
         Ok(live)
-    }
-
-    /// Where a renewal after a 401 is reported, so it is never silent.
-    pub fn with_note(self, note: impl Fn(&str) + Send + Sync + 'static) -> Self {
-        let mut inner = Arc::try_unwrap(self.inner)
-            .unwrap_or_else(|_| unreachable!("with_note is called before the session is shared"));
-        inner.note = Some(Arc::new(note));
-        Live {
-            inner: Arc::new(inner),
-        }
     }
 
     /// The base the Keychain's session was issued for: the only one its

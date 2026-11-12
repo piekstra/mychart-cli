@@ -226,7 +226,7 @@ pub fn run<T: Wire, W: std::io::Write>(
         let p = params(patient, extra, *dated, since);
         let search = describe(resource_type, &p);
         let mut n = 0usize;
-        let result = fhir.search_each(resource_type, &p, |r| {
+        let (summary, result) = fhir.search_each(resource_type, &p, |r| {
             let value = r.value().ok();
             // A resource another search already wrote has had its files
             // fetched after it.
@@ -245,20 +245,22 @@ pub fn run<T: Wire, W: std::io::Write>(
             }
             Ok(())
         });
+        // Entries on the pages read that were not resources, whether or
+        // not a later page failed.
+        if summary.malformed > 0 {
+            w.skip(skip_of(
+                resource_type,
+                None,
+                Some(search.clone()),
+                "upstream",
+                format!(
+                    "{} search entries were not FHIR resources",
+                    summary.malformed
+                ),
+            ));
+        }
         match result {
-            Ok(summary) => {
-                if summary.malformed > 0 {
-                    w.skip(skip_of(
-                        resource_type,
-                        None,
-                        Some(search.clone()),
-                        "upstream",
-                        format!(
-                            "{} search entries were not FHIR resources",
-                            summary.malformed
-                        ),
-                    ));
-                }
+            Ok(()) => {
                 if summary.truncated {
                     w.skip(skip_of(
                         resource_type,
@@ -271,7 +273,7 @@ pub fn run<T: Wire, W: std::io::Write>(
                 note(format!("{search}: {n}"));
             }
             Err(Failure::Skip { code, reason }) => {
-                note(format!("{search}: skipped ({code})"));
+                note(format!("{search}: {n}, then skipped ({code})"));
                 w.skip(skip_of(resource_type, None, Some(search), code, reason));
             }
             Err(f) => return Err(f.into_error()),

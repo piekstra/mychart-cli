@@ -42,6 +42,11 @@ pub struct Config {
     /// past the first hour (default true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_registration: Option<bool>,
+    /// A setting mychart 0.1 had and 0.2 does not use: the redirect is
+    /// always on 127.0.0.1. Kept as read so `auth login` can say that a
+    /// stored `localhost` no longer applies; `config unset` clears it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_host: Option<String>,
 }
 
 impl Config {
@@ -55,6 +60,17 @@ impl Config {
 
     pub fn dynamic_registration(&self) -> bool {
         self.dynamic_registration.unwrap_or(true)
+    }
+
+    /// The redirect URI every sign-in sends (RFC 8252 §7.3).
+    pub fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{}/callback", self.redirect_port())
+    }
+
+    /// A `redirect_host` 0.1 stored that names another host than the one
+    /// 0.2 sends, so the app's registration may not match.
+    pub fn stale_redirect_host(&self) -> Option<&str> {
+        self.redirect_host.as_deref().filter(|h| *h != "127.0.0.1")
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), CliError> {
@@ -71,6 +87,16 @@ impl Config {
             "directory_url" => {
                 pk_cli_core::transport::require_secure_url(value)?;
                 self.directory_url = Some(value.to_string());
+            }
+            "redirect_host" => {
+                return Err(CliError::Usage(format!(
+                    "redirect_host was removed in mychart 0.2: the redirect is always {}",
+                    self.redirect_uri()
+                ))
+                .with_remedy(
+                    "register that URI on the app at fhir.epic.com (docs/registration.md); \
+                     `mychart config unset redirect_host` clears a value 0.1 stored",
+                ))
             }
             "dynamic_registration" => {
                 self.dynamic_registration = Some(
@@ -92,6 +118,7 @@ impl Config {
             "scope" => self.scope = None,
             "directory_url" => self.directory_url = None,
             "dynamic_registration" => self.dynamic_registration = None,
+            "redirect_host" => self.redirect_host = None,
             other => return Err(unknown(other)),
         }
         Ok(())
@@ -136,11 +163,22 @@ mod tests {
         c.set("directory_url", "http://127.0.0.1:9/brands").unwrap();
         c.set("dynamic_registration", "false").unwrap();
         assert!(!c.dynamic_registration());
-        // The redirect host is always 127.0.0.1: no setting names it.
-        assert_eq!(
-            c.set("redirect_host", "localhost").unwrap_err().exit_code(),
-            2
+        // The redirect host is always 127.0.0.1, and setting it says so.
+        let e = c.set("redirect_host", "localhost").unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert!(
+            e.to_string().contains("removed in mychart 0.2")
+                && e.to_string().contains("http://127.0.0.1:8123/callback"),
+            "{e}"
         );
+        // A value 0.1 stored is read only to warn, and unset clears it.
+        let mut old: Config =
+            serde_json::from_str(r#"{"redirect_host":"localhost","redirect_port":7468}"#).unwrap();
+        assert_eq!(old.stale_redirect_host(), Some("localhost"));
+        old.unset("redirect_host").unwrap();
+        assert_eq!(old.stale_redirect_host(), None);
+        let same: Config = serde_json::from_str(r#"{"redirect_host":"127.0.0.1"}"#).unwrap();
+        assert_eq!(same.stale_redirect_host(), None);
         c.unset("redirect_port").unwrap();
         assert_eq!(c.redirect_port(), DEFAULT_REDIRECT_PORT);
         assert_eq!(c.set("nope", "x").unwrap_err().exit_code(), 2);

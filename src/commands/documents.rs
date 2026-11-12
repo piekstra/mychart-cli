@@ -172,7 +172,7 @@ fn list_in<T: crate::fhir::Wire>(
     for extra in [&[("category", "clinical-note")][..], &[][..]] {
         let mut params = vec![("patient".to_string(), patient.to_string())];
         params.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        let r = fhir.search_each("DocumentReference", &params, |r| {
+        let (summary, r) = fhir.search_each("DocumentReference", &params, |r| {
             if seen.insert(r.id.clone()) {
                 if let Ok(v) = r.value() {
                     out.extend(documents_of(&v));
@@ -180,12 +180,14 @@ fn list_in<T: crate::fhir::Wire>(
             }
             Ok(())
         });
-        match r {
-            Ok(summary) if summary.malformed > 0 => ctx.note(format!(
+        if summary.malformed > 0 {
+            ctx.note(format!(
                 "warning: {} DocumentReference entries were not FHIR resources",
                 summary.malformed
-            )),
-            Ok(_) => {}
+            ));
+        }
+        match r {
+            Ok(()) => {}
             Err(Failure::Skip { code, reason }) => ctx.note(format!(
                 "warning: DocumentReference search {extra:?} refused ({code}: {reason})"
             )),

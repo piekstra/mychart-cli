@@ -74,6 +74,11 @@ impl SessionStore for Sessions {
             .map_err(|_| CliError::Other("a sign-in did not serialize".into()))?;
         // What is written is this release's shape, and its stamp says so.
         value["format"] = SESSION_FORMAT.into();
+        // A renewal's answer without `expires_in` is stored with its hour,
+        // as a sign-in's is.
+        if session.tokens.expires_at.is_none() {
+            value["tokens"]["expires_at"] = crate::session::expiry(&session.tokens).into();
+        }
         self.0.write(&session.account(), &value.to_string())
     }
 

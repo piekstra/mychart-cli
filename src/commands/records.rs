@@ -4,13 +4,17 @@ use std::io::Write;
 
 use pk_cli_core::{output, CliError};
 
+use std::path::PathBuf;
+
 use super::{rfc3339, transport, Ctx, BIN};
 use crate::cli::{ExportArgs, RecordsCmd};
 use crate::export;
-use crate::fhir::{origin, Fhir};
+use crate::fhir::{origin, Fhir, Wire};
 use crate::orgs;
 use crate::session::{now, Context};
-use pk_med_records::{Header, RecordsExport, RecordsWriter, Source};
+use pk_med_records::{
+    ExportFile, Finished, Header, RecordsExport, RecordsWriter, Source, EXPORT_FILE,
+};
 
 pub fn run(ctx: &Ctx, cmd: &RecordsCmd) -> Result<(), CliError> {
     let RecordsCmd::Export(args) = cmd;
@@ -69,6 +73,13 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
         ))
         .with_remedy(format!("pipe them into the encrypted vault: `{BIN} records export --patient {} --ndjson | medrec import --from mychart`", c.display())));
     }
+    // Before the Keychain and the network: a symbolic link at
+    // records.ndjson is refused here (exit 2).
+    let file = args
+        .output
+        .as_deref()
+        .map(pk_med_records::create_export_file)
+        .transpose()?;
     let t = transport()?;
     let live = ctx.live(&t, &c)?;
     let fhir = Fhir::new(&t, &live)?;
@@ -81,7 +92,7 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
         }
     };
 
-    match &args.output {
+    match file {
         None => {
             let stdout = std::io::stdout();
             let mut w = RecordsWriter::start(std::io::BufWriter::new(stdout.lock()), &head)?;
@@ -104,44 +115,85 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
                 }
             }
         }
-        Some(dir) => {
-            // A complete stream replaces records.ndjson; one cut short goes
-            // to records.incomplete.ndjson and the last complete export is
-            // kept. Nothing at either name changes until the commit.
-            let mut file = pk_med_records::create_export_file(dir)?;
-            let mut out = std::io::BufWriter::new(file.file());
-            let mut w = RecordsWriter::start(&mut out, &head)?;
-            let result = export::run(&fhir, &mut w, &c.id, since, &note);
-            let finished = w.finish(rfc3339(now()), result.as_ref().err())?;
-            std::io::Write::flush(&mut out)
-                .map_err(|e| CliError::Other(format!("writing the export: {e}")))?;
-            drop(out);
-            let path = file.commit(&finished)?;
-            let payload = RecordsExport::new(path.display().to_string(), &finished);
-            let trailer = &finished.trailer;
+        Some(file) => {
+            let done = export_to_dir(file, &fhir, &head, &c.id, since, &note)?;
+            let payload = RecordsExport::new(done.path.display().to_string(), &done.finished);
+            let trailer = &done.finished.trailer;
             if ctx.json() {
                 output::json(&super::to_json(&payload)?);
             } else {
                 let n = trailer.total();
+                let mut out = std::io::stdout();
                 let _ = writeln!(
-                    std::io::stdout(),
+                    out,
                     "{} {n} resources to {} ({} skipped)",
                     if trailer.complete {
                         "wrote"
                     } else {
                         "wrote an incomplete stream of"
                     },
-                    path.display(),
+                    done.path.display(),
                     trailer.skipped.len()
                 );
+                if let Some(kept) = &done.kept {
+                    let _ = writeln!(
+                        out,
+                        "the last complete export, {}, is unchanged",
+                        kept.display()
+                    );
+                }
             }
-            if let Err(e) = result {
+            if let Some(e) = done.error {
                 eprintln!("error: {e}");
                 std::process::exit(e.exit_code());
             }
             Ok(())
         }
     }
+}
+
+/// What `records export -o` wrote.
+pub struct DirExport {
+    /// `records.ndjson` for a complete stream, `records.incomplete.ndjson`
+    /// for one cut short.
+    pub path: PathBuf,
+    pub finished: Finished,
+    /// The last complete `records.ndjson`, left as it was, when this stream
+    /// was cut short.
+    pub kept: Option<PathBuf>,
+    /// Why the stream was cut short.
+    pub error: Option<CliError>,
+}
+
+/// The export into `file`. A complete stream replaces records.ndjson; one
+/// cut short goes to records.incomplete.ndjson and the last complete export
+/// is kept. Nothing at either name changes until the commit. An error that
+/// cut the stream short is in [`DirExport::error`], after the stream is
+/// committed; an `Err` means nothing was committed.
+pub fn export_to_dir<T: Wire>(
+    mut file: ExportFile,
+    fhir: &Fhir<T>,
+    head: &Header,
+    patient: &str,
+    since: Option<&str>,
+    note: &dyn Fn(String),
+) -> Result<DirExport, CliError> {
+    let mut out = std::io::BufWriter::new(file.file());
+    let mut w = RecordsWriter::start(&mut out, head)?;
+    let result = export::run(fhir, &mut w, patient, since, note);
+    let finished = w.finish(rfc3339(now()), result.as_ref().err())?;
+    std::io::Write::flush(&mut out)
+        .map_err(|e| CliError::Other(format!("writing the export: {e}")))?;
+    drop(out);
+    let path = file.commit(&finished)?;
+    let complete = path.with_file_name(EXPORT_FILE);
+    let kept = (!finished.trailer.complete && complete.is_file()).then_some(complete);
+    Ok(DirExport {
+        path,
+        finished,
+        kept,
+        error: result.err(),
+    })
 }
 
 #[cfg(test)]

@@ -111,6 +111,7 @@ fn live(ctx: &Ctx, c: &session::Context) -> Result<Live<BlockingTransport>, CliE
         ctx.vault.clone(),
         &ctx.lock,
         c,
+        None,
     )
 }
 
@@ -869,6 +870,7 @@ fn a_401_to_a_just_renewed_token_ends_the_sign_in() {
             status: 401,
             body: "{}".into(),
             times: 2,
+            start: None,
         })
     });
     let e = export_result(&ctx, SELF_PATIENT).unwrap_err();
@@ -1054,4 +1056,238 @@ fn a_sign_in_stored_by_0_1_asks_for_a_new_one_and_logout_removes_it() {
     )
     .unwrap();
     assert!(ctx.vault.read(&c.account()).unwrap().is_none());
+}
+
+#[test]
+fn an_id_token_without_this_sign_ins_nonce_is_refused_and_nothing_is_stored() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    mock.set(|st| st.wrong_nonce = true);
+    let e = commands::auth::run(
+        &ctx,
+        &AuthCmd::Login(LoginArgs {
+            org: ORG_ID.into(),
+            label: Some("adult1".into()),
+            no_browser: false,
+            timeout: 1,
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    assert!(e.to_string().contains("nonce"), "{e}");
+    // Refused at the exchange: no install registered, nothing kept.
+    assert_eq!(mock.get(|st| (st.nonces, st.registrations)), (1, 0));
+    assert!(ctx.contexts().unwrap().is_empty());
+    assert!(sessions(&ctx)
+        .load(&session::account(ORG_ID, SELF_PATIENT))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_search_page_that_fails_keeps_the_pages_before_it_and_is_one_skip() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    // The laboratory search has three results, two to a page: its second
+    // page is refused.
+    mock.set(|st| {
+        st.faults
+            .push(mock_epic::Fault::on_page("Observation", 2, 400))
+    });
+    let (values, _) = export_stream(&ctx, SELF_PATIENT, None);
+    let observations: Vec<&str> = values
+        .iter()
+        .filter(|v| v["resourceType"] == "Observation")
+        .filter_map(|v| v["id"].as_str())
+        .collect();
+    assert!(
+        observations.contains(&"obs-lab-1") && observations.contains(&"obs-lab-2"),
+        "{observations:?}"
+    );
+    assert!(!observations.contains(&"obs-lab-3"), "{observations:?}");
+    let trailer = values.last().unwrap();
+    let laboratory: Vec<&serde_json::Value> = trailer["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            s["search"]
+                .as_str()
+                .is_some_and(|q| q.contains("laboratory"))
+        })
+        .collect();
+    assert_eq!(laboratory.len(), 1, "{trailer}");
+    assert_eq!(laboratory[0]["code"], "unsupported");
+    assert!(
+        laboratory[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("page 2 failed, after 1 that are kept"),
+        "{}",
+        laboratory[0]
+    );
+    // A refused search is a skip, not the end of the export.
+    assert_eq!(trailer["complete"], true);
+}
+
+/// `records export -o <out>` for the signed-in adult, as the command runs
+/// it, short of printing and exiting.
+fn export_dir(ctx: &Ctx, out: &Path) -> commands::records::DirExport {
+    let c = ctx
+        .contexts()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == SELF_PATIENT)
+        .unwrap();
+    let t = commands::transport().unwrap();
+    let live = live(ctx, &c).unwrap();
+    let fhir = mychart::fhir::Fhir::new(&t, &live).unwrap();
+    let file = pk_med_records::create_export_file(out).unwrap();
+    commands::records::export_to_dir(
+        file,
+        &fhir,
+        &commands::records::header(&c, None),
+        &c.id,
+        None,
+        &|_| {},
+    )
+    .unwrap()
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut n: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    n.sort();
+    n
+}
+
+#[test]
+fn an_export_to_a_directory_cut_short_keeps_the_last_complete_one() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let out = dir.path().join("export");
+    let first = export_dir(&ctx, &out);
+    assert!(first.error.is_none() && first.finished.trailer.complete);
+    assert_eq!(first.path, out.join("records.ndjson"));
+    assert!(first.kept.is_none());
+    let before = std::fs::read(out.join("records.ndjson")).unwrap();
+
+    // Partway through, the token is refused, and so is its renewal.
+    mock.set(|st| {
+        st.refuse_jwt_bearer = true;
+        st.faults.push(mock_epic::Fault {
+            path: "Condition".into(),
+            status: 401,
+            body: "{}".into(),
+            times: 1,
+            start: None,
+        });
+    });
+    let cut = export_dir(&ctx, &out);
+    assert_eq!(cut.error.as_ref().map(CliError::exit_code), Some(3));
+    assert!(!cut.finished.trailer.complete);
+    assert_eq!(cut.path, out.join("records.incomplete.ndjson"));
+    assert_eq!(cut.kept, Some(out.join("records.ndjson")));
+    assert_eq!(std::fs::read(out.join("records.ndjson")).unwrap(), before);
+    assert_eq!(
+        names(&out),
+        ["records.incomplete.ndjson", "records.ndjson"],
+        "and no temporary file"
+    );
+    // What was read before the refusal is there, and the trailer says the
+    // stream is cut short.
+    let text = std::fs::read_to_string(&cut.path).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(lines
+        .iter()
+        .any(|v| v["resourceType"] == "Patient" && v["id"] == SELF_PATIENT));
+    assert_eq!(lines.last().unwrap()["complete"], false);
+
+    // The next complete export replaces records.ndjson and removes the
+    // incomplete one.
+    mock.set(|st| st.refuse_jwt_bearer = false);
+    login(&ctx, "adult1");
+    let again = export_dir(&ctx, &out);
+    assert!(again.error.is_none() && again.kept.is_none());
+    assert_eq!(names(&out), ["records.ndjson"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_export_to_a_directory_refuses_a_symbolic_link_before_the_network() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let out = dir.path().join("export");
+    std::fs::create_dir(&out).unwrap();
+    let elsewhere = dir.path().join("elsewhere.ndjson");
+    std::fs::write(&elsewhere, "not an export\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out.join("records.ndjson")).unwrap();
+    let requests = mock.get(|st| (st.hits.values().sum::<usize>(), st.jwt_bearer_grants));
+    let e = commands::records::run(
+        &ctx,
+        &mychart::cli::RecordsCmd::Export(mychart::cli::ExportArgs {
+            who: mychart::cli::PatientArgs {
+                patient: Some("adult1".into()),
+                org: None,
+            },
+            since: None,
+            ndjson: false,
+            output: Some(out.clone()),
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(e.exit_code(), 2, "{e}");
+    assert!(e.to_string().contains("symbolic link"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).unwrap(),
+        "not an export\n"
+    );
+    assert!(std::fs::symlink_metadata(out.join("records.ndjson"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(names(&out), ["records.ndjson"]);
+    assert_eq!(
+        mock.get(|st| (st.hits.values().sum::<usize>(), st.jwt_bearer_grants)),
+        requests,
+        "refused before any request"
+    );
+}
+
+#[test]
+fn a_token_answer_without_expires_in_lasts_an_hour_and_shows_when() {
+    for registered in [false, true] {
+        let mock = MockEpic::start();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), &mock, |c| {
+            c.dynamic_registration = Some(registered)
+        });
+        mock.set(|st| st.omit_expires_in = true);
+        login(&ctx, "adult1");
+        // Without registration the sign-in's own token is kept; with it,
+        // the first JWT-bearer grant's.
+        let s = stored(&ctx, SELF_PATIENT);
+        assert_eq!(s.dynamic_client.is_some(), registered);
+        assert_eq!(
+            s.tokens.expires_at,
+            Some(s.tokens.obtained_at + session::UNSTATED_LIFETIME_SECS),
+            "registered: {registered}"
+        );
+        let c = ctx.contexts().unwrap().pop().unwrap();
+        let row = commands::auth::patient_dto(&c, Some(&s));
+        assert!(row["status"]["expires_at"].is_string(), "{row}");
+        assert_eq!(row["status"]["authenticated"], true);
+    }
 }

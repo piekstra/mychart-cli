@@ -69,6 +69,7 @@ pub fn origin(url: &str) -> Option<String> {
 /// What a search returned besides its resources.
 #[derive(Debug, Default)]
 pub struct SearchSummary {
+    /// Pages read, and handed to the caller's `each`.
     pub pages: usize,
     /// What the OperationOutcomes the server attached say.
     pub outcomes: Vec<String>,
@@ -163,30 +164,61 @@ impl<T: Wire> Fhir<T> {
     }
 
     /// A search over every page (to the client's page cap), `each` seeing
-    /// every resource in server order. A page that fails fails the search:
-    /// the caller records it as one skip.
+    /// every resource in server order, page by page as it is read. A page
+    /// that fails ends the search: the pages before it have been handed to
+    /// `each` and stay, and the failure says how many there were. The
+    /// summary covers the pages read either way; an `Err` from `each` stops
+    /// the search with no further request.
     pub fn search_each(
         &self,
         resource_type: &str,
         params: &[(String, String)],
         mut each: impl FnMut(RawResource) -> Result<(), Failure>,
-    ) -> Result<SearchSummary, Failure> {
+    ) -> (SearchSummary, Result<(), Failure>) {
         let params: Vec<(&str, String)> = params
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let result = block_on(self.client.search(resource_type, &params))
-            .map_err(|e| self.failure(e, "upstream"))?;
-        let summary = SearchSummary {
-            pages: result.pages as usize,
-            outcomes: result.outcomes.iter().map(|o| o.summary()).collect(),
-            truncated: result.truncated,
-            malformed: result.unreadable.len(),
-        };
-        for r in result.resources.into_iter().chain(result.included) {
-            each(r)?;
+        let mut summary = SearchSummary::default();
+        let mut stopped = None;
+        let result = block_on(self.client.search_pages(resource_type, &params, |page| {
+            summary.pages = page.number as usize;
+            summary
+                .outcomes
+                .extend(page.outcomes.iter().map(|o| o.summary()));
+            summary.malformed += page.unreadable.len();
+            for r in page.resources.into_iter().chain(page.included) {
+                if let Err(f) = each(r) {
+                    stopped = Some(f);
+                    // Only a signal to stop asking: `stopped` is what
+                    // the caller gets.
+                    return Err(CliError::Other("stopped".into()));
+                }
+            }
+            Ok(())
+        }));
+        if let Some(f) = stopped {
+            return (summary, Err(f));
         }
-        Ok(summary)
+        let result = match result {
+            Ok(end) => {
+                summary.pages = end.pages as usize;
+                summary.truncated = end.truncated;
+                Ok(())
+            }
+            Err(e) => Err(match self.failure(e, "upstream") {
+                Failure::Skip { code, reason } if summary.pages > 0 => Failure::Skip {
+                    code,
+                    reason: format!(
+                        "page {} failed, after {} that are kept: {reason}",
+                        summary.pages + 1,
+                        summary.pages
+                    ),
+                },
+                f => f,
+            }),
+        };
+        (summary, result)
     }
 
     /// The body of a 2xx for a path under the base, or an absolute URL on
@@ -289,29 +321,37 @@ mod tests {
     #[test]
     fn each_refusal_is_a_skip_and_only_the_sign_in_and_the_network_stop() {
         let outcome = r#"{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing"}]}"#;
-        let t = Scripted::with(vec![
-            ok(200, "<html>down</html>"),
-            ok(403, outcome),
-            ok(404, outcome),
-            ok(400, outcome),
-            ok(500, outcome),
-            ok(401, outcome),
-            Err(CliError::Upstream("connection refused".into())),
-        ]);
+        let answers = [
+            (ok(200, "<html>down</html>"), "upstream"),
+            (ok(403, outcome), "forbidden"),
+            (ok(404, outcome), "not_found"),
+            (ok(410, outcome), "not_found"),
+            (ok(400, outcome), "unsupported"),
+            (ok(405, outcome), "unsupported"),
+            (ok(422, outcome), "unsupported"),
+            (ok(500, outcome), "upstream"),
+            (ok(501, outcome), "upstream"),
+            (ok(503, outcome), "upstream"),
+            (ok(401, outcome), "auth"),
+            (
+                Err(CliError::Upstream("connection refused".into())),
+                "fatal",
+            ),
+        ];
+        let want: Vec<&str> = answers.iter().map(|(_, w)| *w).collect();
+        let t = Scripted::with(answers.into_iter().map(|(a, _)| a).collect());
         let f = fhir(&t);
-        let got: Vec<&str> = (0..7).map(|_| code(f.read("Patient/p1"))).collect();
-        assert_eq!(
-            got,
-            [
-                "upstream",
-                "forbidden",
-                "not_found",
-                "unsupported",
-                "upstream",
-                "auth",
-                "fatal"
-            ]
-        );
+        let got: Vec<&str> = (0..want.len())
+            .map(|_| code(f.read("Patient/p1")))
+            .collect();
+        assert_eq!(got, want);
+        // `unsupported` is a usage refusal (exit 2) when it ends a command.
+        let e = Failure::Skip {
+            code: "unsupported",
+            reason: "r".into(),
+        }
+        .into_error();
+        assert_eq!(e.exit_code(), 2);
     }
 
     #[test]

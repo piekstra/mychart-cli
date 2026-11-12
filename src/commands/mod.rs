@@ -100,9 +100,12 @@ impl Ctx {
         t: &BlockingTransport,
         c: &Context,
     ) -> Result<crate::session::Live<BlockingTransport>, CliError> {
-        Ok(
-            crate::session::Live::start(t, self.vault.clone(), &self.lock, c)?
-                .with_note(self.notes()),
+        crate::session::Live::start(
+            t,
+            self.vault.clone(),
+            &self.lock,
+            c,
+            Some(std::sync::Arc::new(self.notes())),
         )
     }
 }

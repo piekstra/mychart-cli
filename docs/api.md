@@ -47,7 +47,11 @@ tokens)". [registration.md](registration.md) has the values mychart needs.
   8252 §7.3). [registration.md](registration.md) also lists the
   `http://localhost:7468/callback` spelling, which mychart does not send.
   Epic compares redirect URIs exactly, so the port is fixed (`mychart
-  config set redirect_port`), never chosen at random.
+  config set redirect_port`), never chosen at random. mychart 0.1 had a
+  `redirect_host` setting; 0.2 refuses `config set redirect_host` (exit 2),
+  and `auth login` warns while config.json still holds a host other than
+  127.0.0.1, since an app registered with only that host's URI does not
+  match.
   **Not settled by the docs:** whether a production organization accepts an
   http loopback URI. Redirect URIs stay editable after Ready for Production
   ("With the exception of adding redirect URIs and modifying your JWK Set
@@ -73,7 +77,8 @@ What mychart does (oauth2, "Dynamic Client Registration"):
    fhirUser`, with a fresh OpenID `nonce`. Epic's ID token carries it back:
    "The nonce claim will be present only if it was specified in the
    authorization request." pk-med-smart refuses an ID token without it, or
-   with another (exit 3). The access token the launch returns is the RFC
+   with another (exit 3): nothing is stored and no client is registered.
+   The access token the launch returns is the RFC
    7591 initial access token: "This token is intentionally one-time-use
    and should be used for registration immediately."
 2. "Generate a public-private key pair on the user's phone or computer" and
@@ -116,7 +121,10 @@ Lifetimes:
 
 `mychart auth status` shows each sign-in's `renewable` flag and token
 expiry; when the period ends the grant fails and mychart asks for a new
-`auth login` (exit 3).
+`auth login` (exit 3). A token answer without `expires_in` is taken to last
+an hour, as mychart 0.1 took it (Epic's answers state it), so `expires_at`
+in `auth login` and `auth status` is always an RFC 3339 time and such a
+token is renewed before it lapses rather than after a 401.
 
 A server can refuse an access token before its `expires_in` is up (a 401:
 revoked, or forgotten after a restart). mychart then renews it once under
@@ -283,8 +291,10 @@ range requests, so a failed download starts over.
   | 429, 5xx or an HTML 403 (an edge, not the server) after its retries; a body that is not the FHIR asked for | `upstream` skip |
   | no answer after its retries | stop, exit 5 |
 
-  A search is read whole before any of it is written, so a page that fails
-  makes the whole search one skip: the stream holds no part of a search.
+  A search is written page by page as it is read (pk-med-fhir's
+  `search_pages`). A page that fails ends that search with one skip, whose
+  reason names the page and how many before it were kept; their resources
+  are in the stream.
 - **Next links** are absolute URLs on the server's own spelling of the host,
   which can differ in case from the directory's; mychart compares origins
   without case and follows no link to another host. An attachment URL on
@@ -307,6 +317,14 @@ range requests, so a failed download starts over.
 - **A `Binary`** is asked for as FHIR JSON (`data` in base64). One answered
   with another content type (the raw file) is an `upstream` skip, as is one
   over the stream's line limit (`too_large`).
+- **`records export -o <DIR>`** (Epic's sandbox and servers on this machine
+  only) writes `<DIR>/records.ndjson` when the stream is complete. A stream
+  cut short (exit 3 or 5) goes to `<DIR>/records.incomplete.ndjson`
+  instead, and `records.ndjson`, the last complete export, is left as it
+  was. The `records-export/v1` result's `path` names the file written and
+  its `complete` is false; the text output also names the kept file. The
+  next complete export removes the incomplete one. A symbolic link at
+  `records.ndjson` is refused before the Keychain or the network (exit 2).
 - **The sandbox** is shared and refreshed weekly: "The Sandbox is refreshed
   every Sunday at approximately 8:00 PM Central Time"; a new app syncs to it
   in about an hour. Its test patients (`fhircamila`, `fhirderrick`,

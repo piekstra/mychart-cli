@@ -85,6 +85,14 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
              `{BIN} config set {key_name} <ID>`"
         ))
     })?;
+    if let Some(host) = cfg.stale_redirect_host() {
+        ctx.note(format!(
+            "warning: config.json sets redirect_host `{host}`, which mychart 0.2 does not use: \
+             this sign-in's redirect is {}. If the app at fhir.epic.com lists only \
+             `{host}`, Epic refuses it; add this URI there, then `{BIN} config unset redirect_host`",
+            cfg.redirect_uri()
+        ));
+    }
     // Discovery's answer names the endpoints the sign-in goes to, so it too
     // must come over https (or from this machine).
     pk_cli_core::transport::require_secure_url(&org.fhir_base)?;
@@ -124,6 +132,7 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
     })?;
     let oauth = OAuthClient::new(t.clone(), BIN, version);
     let mut session = block_on(signin.exchange(&oauth, &client, &code, &org.id, now_u64()))?;
+    session.tokens.expires_at = Some(session::expiry(&session.tokens));
     let patient = session.patient.clone().ok_or_else(|| {
         CliError::Upstream(
             "the organization granted access without a patient; the app is not registered \
@@ -195,15 +204,12 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
         ctx.note(format!(
             "warning: {} offers this app no dynamic client registration; this sign-in lasts until {}",
             org.name,
-            session
-                .tokens
-                .expires_at_rfc3339()
-                .unwrap_or_else(|| "the organization ends it".into())
+            session::expires_at(&session.tokens)
         ));
     }
 
     let verified = verify(&t, &session);
-    let expires_at = session.tokens.expires_at_rfc3339();
+    let expires_at = session::expires_at(&session.tokens);
     let payload = json!({
         "schema": "auth-login/v1",
         "stored": true,
@@ -234,10 +240,7 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
             if session.renewable() {
                 "renews without a sign-in for the period chosen in MyChart".to_string()
             } else {
-                format!(
-                    "ends at {}",
-                    expires_at.unwrap_or_else(|| "a time the organization did not say".into())
-                )
+                format!("ends at {}", expires_at)
             }
         );
     }
@@ -303,7 +306,7 @@ pub fn patient_dto(c: &Context, session: Option<&SmartSession>) -> Value {
         v["status"] = json!({
             "authenticated": session::usable(s, now()),
             "renewable": s.renewable(),
-            "expires_at": s.tokens.expires_at_rfc3339(),
+            "expires_at": session::expires_at(&s.tokens),
         });
         if let Some(at) = s.refused_at {
             v["status"]["refused_at"] = rfc3339(at as i64).into();

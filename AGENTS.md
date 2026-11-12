@@ -23,7 +23,7 @@ the `pk-cli-*` crates from [cli-common](https://github.com/piekstra/cli-common).
 | `tests/support/mock_epic.rs` | a mock Epic organization on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | Epic's behaviour and traps, quoted; read before changing auth or export |
 
-medical-common v0.4.0 (pinned with cli-common v0.31.1, the tag it builds
+medical-common v0.4.1 (pinned with cli-common v0.31.1, the tag it builds
 on) owns the protocol and the stream:
 
 - `pk-med-smart`: discovery, the standalone launch with PKCE, the code
