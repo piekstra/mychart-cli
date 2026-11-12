@@ -263,18 +263,20 @@ pub fn access_token<T: Transport>(
                 Some(k) => Some(SigningKey::from_stored(k)?),
                 None => None,
             };
-            let granted = match (&latest.refresh_token, &latest.dynamic_client_id, &key) {
-                (Some(rt), dynamic, key) => smart::refresh_grant(
-                    t,
-                    &latest.token_endpoint,
-                    dynamic.as_deref().unwrap_or(&latest.client_id),
-                    rt,
-                    key.as_ref(),
-                    now,
-                ),
-                (None, Some(dynamic), Some(key)) => {
+            // The dynamic client's JWT grant first: a refresh token from the
+            // code exchange was issued to the app's client id, not to it.
+            let granted = match (&latest.dynamic_client_id, &key, &latest.refresh_token) {
+                (Some(dynamic), Some(key), _) => {
                     smart::jwt_bearer_grant(t, &latest.token_endpoint, dynamic, key, now)
                 }
+                (_, _, Some(rt)) => smart::refresh_grant(
+                    t,
+                    &latest.token_endpoint,
+                    &latest.client_id,
+                    rt,
+                    None,
+                    now,
+                ),
                 _ => return Err(expired(ctx, "it was stored without a way to renew it")),
             }
             .map_err(|e| {
@@ -326,6 +328,21 @@ impl<'a, T: Transport> Live<'a, T> {
         context: &'a Context,
     ) -> Result<Self, CliError> {
         let session = access_token(t, vault, lock, context)?;
+        // The token goes to the server it was issued for, as the Keychain
+        // records it; the index is a plain file anyone running as this user
+        // can edit.
+        if crate::fhir::origin(&session.fhir_base) != crate::fhir::origin(&context.fhir_base) {
+            return Err(CliError::Auth(format!(
+                "the stored sign-in for patient {} was made at {}, but the patient index names {}",
+                context.display(),
+                crate::fhir::origin(&session.fhir_base).unwrap_or_default(),
+                crate::fhir::origin(&context.fhir_base).unwrap_or_default()
+            ))
+            .with_remedy(format!(
+                "sign in again: `mychart auth login --org {}`",
+                context.organization
+            )));
+        }
         Ok(Live {
             t,
             vault,
@@ -335,6 +352,8 @@ impl<'a, T: Transport> Live<'a, T> {
         })
     }
 
+    /// The base the Keychain's session was issued for: the only one its
+    /// token is sent to.
     pub fn fhir_base(&self) -> String {
         self.session.borrow().fhir_base.clone()
     }

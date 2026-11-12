@@ -102,30 +102,45 @@ pub fn query_param(input: &str, key: &str) -> Option<String> {
     })
 }
 
-/// The authorization code from the redirect's request target, once its
-/// `state` matches. An `error` from the authorization server is an auth
-/// failure carrying its description.
-pub fn code_from_callback(target: &str, expected_state: &str) -> Result<String, CliError> {
+/// What one request to the redirect path says.
+#[derive(Debug)]
+pub enum Callback {
+    /// This sign-in's authorization code.
+    Code(String),
+    /// The authorization server ended this sign-in (`error`, with this
+    /// sign-in's `state`).
+    Refused(CliError),
+    /// Not this sign-in's answer: no `state`, or another one (an old tab
+    /// reloaded, another program, a web page). Answered and ignored.
+    Foreign,
+}
+
+/// Classify a redirect's request target. Nothing in it counts until its
+/// `state` matches, so no other page or program can end the sign-in.
+pub fn code_from_callback(target: &str, expected_state: &str) -> Callback {
+    if query_param(target, "state").as_deref() != Some(expected_state) {
+        return Callback::Foreign;
+    }
     if let Some(err) = query_param(target, "error") {
-        let desc = query_param(target, "error_description").unwrap_or_default();
-        return Err(CliError::Auth(format!(
-            "the sign-in was refused ({err}{}{desc})",
+        let desc = printable(&query_param(target, "error_description").unwrap_or_default());
+        return Callback::Refused(CliError::Auth(format!(
+            "the sign-in was refused ({}{}{desc})",
+            printable(&err),
             if desc.is_empty() { "" } else { ": " }
         )));
     }
-    if query_param(target, "state").as_deref() != Some(expected_state) {
-        return Err(CliError::Auth(
-            "the sign-in's returned `state` did not match; the callback was refused as a \
-             possible forgery. Sign in again"
-                .into(),
-        ));
-    }
     match query_param(target, "code") {
-        Some(c) if !c.is_empty() => Ok(c),
-        _ => Err(CliError::Auth(
+        Some(c) if !c.is_empty() => Callback::Code(c),
+        _ => Callback::Refused(CliError::Auth(
             "the sign-in returned no authorization code".into(),
         )),
     }
+}
+
+/// Text from the redirect, fit for a terminal: control characters (escape
+/// sequences included) dropped, at most 200 characters.
+fn printable(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 /// A one-shot loopback listener for the redirect (RFC 8252 §7.3).
@@ -194,13 +209,34 @@ impl LoopbackListener {
                         respond(&mut stream, 404, "Not found.");
                         continue;
                     }
-                    let result = code_from_callback(&target, expected_state);
-                    let msg = match &result {
-                        Ok(_) => "mychart: signed in. You can close this tab and return to the terminal.",
-                        Err(_) => "mychart: the sign-in did not complete. Return to the terminal for details.",
-                    };
-                    respond(&mut stream, 200, msg);
-                    return result;
+                    match code_from_callback(&target, expected_state) {
+                        Callback::Code(code) => {
+                            respond(
+                                &mut stream,
+                                200,
+                                "mychart: signed in. You can close this tab and return to the terminal.",
+                            );
+                            return Ok(code);
+                        }
+                        Callback::Refused(e) => {
+                            respond(
+                                &mut stream,
+                                200,
+                                "mychart: the sign-in did not complete. Return to the terminal for details.",
+                            );
+                            return Err(e);
+                        }
+                        Callback::Foreign => {
+                            respond(
+                                &mut stream,
+                                400,
+                                "mychart: this is not the sign-in mychart is waiting for.",
+                            );
+                            eprintln!(
+                                "ignored a request to the redirect that did not carry this sign-in's state; still waiting"
+                            );
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -244,7 +280,11 @@ fn read_request_target(stream: &mut TcpStream) -> Result<String, CliError> {
 
 fn respond(stream: &mut TcpStream, status: u16, msg: &str) {
     let body = format!("<!doctype html><meta charset=utf-8><title>mychart</title><p>{msg}</p>");
-    let reason = if status == 200 { "OK" } else { "Not Found" };
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
@@ -313,27 +353,68 @@ mod tests {
 
     #[test]
     fn the_callback_yields_the_code_only_when_state_matches() {
-        assert_eq!(
-            code_from_callback("/callback?code=abc%2Fdef&state=s1", "s1").unwrap(),
-            "abc/def"
-        );
-        let forged = code_from_callback("/callback?code=abc&state=other", "s1").unwrap_err();
-        assert_eq!(forged.exit_code(), 3);
-        assert!(code_from_callback("/callback?state=s1", "s1").is_err());
+        assert!(matches!(
+            code_from_callback("/callback?code=abc%2Fdef&state=s1", "s1"),
+            Callback::Code(c) if c == "abc/def"
+        ));
+        assert!(matches!(
+            code_from_callback("/callback?code=abc&state=other", "s1"),
+            Callback::Foreign
+        ));
+        assert!(matches!(
+            code_from_callback("/callback?code=abc", "s1"),
+            Callback::Foreign
+        ));
+        assert!(matches!(
+            code_from_callback("/callback?state=s1", "s1"),
+            Callback::Refused(e) if e.exit_code() == 3
+        ));
     }
 
     #[test]
-    fn an_error_callback_carries_the_servers_description() {
-        let e = code_from_callback(
-            "/callback?error=access_denied&error_description=User+declined&state=s1",
+    fn an_error_counts_only_with_this_sign_ins_state_and_prints_safely() {
+        let Callback::Refused(e) = code_from_callback(
+            "/callback?error=access_denied&error_description=User+declined%1B%5D0%3Bx%07&state=s1",
             "s1",
-        )
-        .unwrap_err();
+        ) else {
+            panic!("an error with the right state ends the sign-in")
+        };
         assert_eq!(e.exit_code(), 3);
-        assert!(
-            e.to_string().contains("access_denied: User declined"),
-            "{e}"
-        );
+        let text = e.to_string();
+        assert!(text.contains("access_denied: User declined]0;x"), "{text}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert!(matches!(
+            code_from_callback("/callback?error=access_denied&state=other", "s1"),
+            Callback::Foreign
+        ));
+        assert!(matches!(
+            code_from_callback("/callback?error=access_denied", "s1"),
+            Callback::Foreign
+        ));
+    }
+
+    #[test]
+    fn a_foreign_request_is_answered_and_the_wait_goes_on() {
+        use std::io::{Read as _, Write as _};
+        let l = LoopbackListener::bind(0, "/callback").unwrap();
+        let port = l.port();
+        let client = std::thread::spawn(move || {
+            let send = |target: &str| {
+                let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                write!(s, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+                let mut out = String::new();
+                let _ = s.read_to_string(&mut out);
+                out
+            };
+            let first = send("/callback?error=x&error_description=gone&state=old");
+            let second = send("/callback?code=good&state=s1");
+            (first, second)
+        });
+        let code = l.wait_for_code("s1", Duration::from_secs(20)).unwrap();
+        assert_eq!(code, "good");
+        let (first, second) = client.join().unwrap();
+        assert!(first.starts_with("HTTP/1.1 400"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
     }
 
     #[test]

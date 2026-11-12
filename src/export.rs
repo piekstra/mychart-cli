@@ -4,10 +4,12 @@
 //! `DiagnosticReport`'s `Binary` right after it, then the medications,
 //! practitioners, organizations and locations the records point at.
 //!
-//! A refused search is a skip in the trailer, never the end of the export;
-//! only a sign-in that stops working or a network that does ends it.
+//! A refused search, an unreadable answer or a file on another server is a
+//! skip in the trailer, never the end of the export; only a sign-in that
+//! stops working, a network that does, or a stream that cannot be written
+//! ends it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use pk_cli_core::transport::Transport;
 use pk_cli_core::CliError;
@@ -191,8 +193,13 @@ pub fn run<T: Transport, W: std::io::Write>(
     note: &dyn Fn(String),
 ) -> Result<(), CliError> {
     let mut refs = BTreeSet::new();
+    let mut tried_binaries = HashSet::new();
     match fhir.read(&format!("Patient/{patient}")) {
         Ok(p) => {
+            if let Some(v) = p.value() {
+                // generalPractitioner, managingOrganization.
+                references(&v, &mut refs);
+            }
             w.resource(&p)?;
         }
         Err(Failure::Skip { code, reason }) => {
@@ -207,22 +214,37 @@ pub fn run<T: Transport, W: std::io::Write>(
         let mut n = 0usize;
         let result = fhir.search_each(resource_type, &p, |r| {
             let value = r.value();
-            if w.resource(&r)? {
-                n += 1;
+            // A resource another search already wrote has had its files
+            // fetched after it.
+            if !w.resource(&r)? {
+                return Ok(());
             }
+            n += 1;
             if let Some(v) = &value {
                 references(v, &mut refs);
                 if matches!(
                     r.resource_type.as_str(),
                     "DocumentReference" | "DiagnosticReport"
                 ) {
-                    binaries(fhir, w, v)?;
+                    binaries(fhir, w, v, &mut tried_binaries)?;
                 }
             }
             Ok(())
         });
         match result {
             Ok(summary) => {
+                if summary.malformed > 0 {
+                    w.skip(skip_of(
+                        resource_type,
+                        None,
+                        Some(search.clone()),
+                        "upstream",
+                        format!(
+                            "{} search entries were not FHIR resources",
+                            summary.malformed
+                        ),
+                    ));
+                }
                 if summary.truncated {
                     w.skip(skip_of(
                         resource_type,
@@ -275,10 +297,13 @@ pub fn run<T: Transport, W: std::io::Write>(
 }
 
 /// Each attachment's Binary, written right after the resource naming it.
+/// A Binary is fetched once per export: one that failed stays a skip rather
+/// than landing later after some other resource.
 fn binaries<T: Transport, W: std::io::Write>(
     fhir: &Fhir<'_, T>,
     w: &mut RecordsWriter<W>,
     v: &Value,
+    tried: &mut HashSet<String>,
 ) -> Result<(), Failure> {
     for url in attachment_urls(v) {
         let Some(id) = binary_id(&url) else {
@@ -291,7 +316,7 @@ fn binaries<T: Transport, W: std::io::Write>(
             ));
             continue;
         };
-        if w.written("Binary", &id) {
+        if !tried.insert(id.clone()) {
             continue;
         }
         match fhir.binary(&url) {

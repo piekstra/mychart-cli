@@ -305,7 +305,7 @@ fn export_stream(
         .unwrap();
     let t = commands::transport().unwrap();
     let live = session::Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
-    let fhir = mychart::fhir::Fhir::new(&t, &c.fhir_base, &live);
+    let fhir = mychart::fhir::Fhir::new(&t, &live.fhir_base(), &live);
     let mut buf = Vec::new();
     let mut w =
         mychart::stream::RecordsWriter::new(&mut buf, &commands::records::header(&c, since))
@@ -582,4 +582,231 @@ fn api_reads_and_refuses_writes_and_other_hosts() {
             .exit_code(),
         3
     );
+}
+
+fn skips(trailer: &serde_json::Value) -> Vec<(String, String, String)> {
+    trailer["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            let text = |k: &str| s[k].as_str().unwrap_or_default().to_string();
+            (text("resource_type"), text("id"), text("code"))
+        })
+        .collect()
+}
+
+#[test]
+fn an_export_goes_past_files_elsewhere_and_answers_that_are_not_fhir() {
+    use serde_json::json;
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    mock.set(|st| {
+        let me = json!({"reference": format!("Patient/{SELF_PATIENT}")});
+        // A note whose file is on another server.
+        let far = json!({
+            "resourceType": "DocumentReference", "id": "doc-far", "subject": me,
+            "date": "2026-02-01T00:00:00Z",
+            "category": [{"coding": [{"code": "clinical-note"}]}],
+            "content": [{"attachment": {"contentType": "application/pdf",
+                "url": "https://elsewhere.example.org/api/FHIR/R4/Binary/bin-far"}}]
+        });
+        st.resources
+            .entry("DocumentReference".into())
+            .or_default()
+            .push((far.clone(), far.to_string()));
+        // A search entry that is not a resource.
+        let goal = json!({"id": "goal-x", "subject": me});
+        st.resources
+            .entry("Goal".into())
+            .or_default()
+            .push((goal.clone(), goal.to_string()));
+        // An organization only the Patient names.
+        let patients = st.resources.get_mut("Patient").unwrap();
+        let (p, text) = patients
+            .iter_mut()
+            .find(|(p, _)| p["id"] == SELF_PATIENT)
+            .unwrap();
+        p["managingOrganization"] = json!({"reference": "Organization/org-1"});
+        *text = p.to_string();
+        let org = json!({"resourceType": "Organization", "id": "org-1", "name": "Example Clinic"});
+        st.resources
+            .entry("Organization".into())
+            .or_default()
+            .push((org.clone(), org.to_string()));
+        st.faults
+            .push(mock_epic::Fault::not_fhir("Practitioner/prac-1"));
+    });
+
+    let (values, _) = export_stream(&ctx, SELF_PATIENT, None);
+    let trailer = values.last().unwrap();
+    assert_eq!(trailer["complete"], true);
+    let skipped = skips(trailer);
+    assert!(
+        skipped.contains(&("Binary".into(), "bin-far".into(), "no_file".into())),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped.contains(&("Practitioner".into(), "prac-1".into(), "upstream".into())),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|(t, _, c)| t == "Goal" && c == "upstream"),
+        "{skipped:?}"
+    );
+    // The searches after the documents ran, and the Patient's reference was read.
+    assert_eq!(trailer["counts"]["MedicationRequest"], 1);
+    assert_eq!(trailer["counts"]["DocumentReference"], 2);
+    assert_eq!(trailer["counts"]["Organization"], 1);
+    assert!(trailer["counts"].get("Goal").is_none());
+    // The token never went to the other server: the mock saw every request.
+    assert_eq!(mock.get(|st| st.hits.get("Binary/bin-far").copied()), None);
+}
+
+#[test]
+fn a_failing_binary_is_retried_in_place_and_fetched_once() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+
+    // One 500 is retried at once and the export carries the file.
+    mock.set(|st| {
+        st.faults
+            .push(mock_epic::Fault::failing("Binary/bin-pdf-1", 1))
+    });
+    let (values, _) = export_stream(&ctx, SELF_PATIENT, None);
+    let trailer = values.last().unwrap();
+    assert_eq!(trailer["counts"]["Binary"], 2);
+    assert!(skips(trailer).iter().all(|(t, _, _)| t != "Binary"));
+
+    // A file that keeps failing is one skip; doc-1 coming back from the
+    // second DocumentReference search does not fetch it again.
+    mock.set(|st| {
+        st.hits.clear();
+        st.faults
+            .push(mock_epic::Fault::failing("Binary/bin-pdf-1", 100));
+    });
+    let (values, _) = export_stream(&ctx, SELF_PATIENT, None);
+    let trailer = values.last().unwrap();
+    assert_eq!(trailer["counts"]["Binary"], 1);
+    let binary_skips: Vec<_> = skips(trailer)
+        .into_iter()
+        .filter(|(t, _, _)| t == "Binary")
+        .collect();
+    assert_eq!(
+        binary_skips,
+        [(
+            "Binary".to_string(),
+            "bin-pdf-1".to_string(),
+            "upstream".to_string()
+        )]
+    );
+    assert_eq!(mock.get(|st| st.hits["Binary/bin-pdf-1"]), 3);
+    assert_eq!(mock.get(|st| st.hits["Binary/bin-html-1"]), 1);
+}
+
+#[test]
+fn a_failed_first_grant_keeps_the_registered_install() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    mock.set(|st| st.refuse_jwt_bearer = true);
+    login(&ctx, "adult1");
+    let s = stored(&ctx, SELF_PATIENT);
+    assert!(s.dynamic_client_id.is_some() && s.private_key.is_some());
+    assert_eq!(s.expires_at, 0);
+    assert_eq!(mock.get(|st| st.registrations), 1);
+
+    let c = ctx.contexts().unwrap().remove(0);
+    let t = commands::transport().unwrap();
+    let Err(e) = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c) else {
+        panic!("a refused grant returned a session")
+    };
+    assert_eq!(e.exit_code(), 3);
+
+    mock.set(|st| st.refuse_jwt_bearer = false);
+    let renewed = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
+    assert!(renewed.is_fresh(session::now()));
+    assert_eq!(mock.get(|st| st.registrations), 1);
+}
+
+#[test]
+fn the_registered_install_renews_even_when_a_refresh_token_is_held() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let c = ctx.contexts().unwrap().remove(0);
+    let mut s = stored(&ctx, SELF_PATIENT);
+    // A refresh token from the code exchange, issued to the app's client id.
+    s.refresh_token = Some("issued-to-the-app".into());
+    s.expires_at = 0;
+    vault::set_json(ctx.vault.as_ref(), &c.account(), &s).unwrap();
+    let before = mock.get(|st| st.jwt_bearer_grants);
+    let t = commands::transport().unwrap();
+    let renewed = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c).unwrap();
+    assert!(renewed.is_fresh(session::now()));
+    assert_eq!(mock.get(|st| st.jwt_bearer_grants), before + 1);
+}
+
+#[test]
+fn a_patient_index_naming_another_server_is_refused() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let mut c = ctx.contexts().unwrap().remove(0);
+    c.fhir_base = "https://elsewhere.example.org/api/FHIR/R4".into();
+    ctx.index().unwrap().upsert(c).unwrap();
+    let hits = mock.get(|st| st.hits.values().sum::<usize>());
+    let Err(e) = commands::api::run(
+        &ctx,
+        &mychart::cli::ApiArgs {
+            method: "GET".into(),
+            path: format!("Patient/{SELF_PATIENT}"),
+            who: mychart::cli::PatientArgs::default(),
+        },
+    ) else {
+        panic!("a request went out under an edited index")
+    };
+    assert_eq!(e.exit_code(), 3);
+    assert!(e.to_string().contains("patient index"), "{e}");
+    assert_eq!(mock.get(|st| st.hits.values().sum::<usize>()), hits);
+}
+
+#[test]
+fn an_organization_without_https_is_refused_before_the_network() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    let mut index = commands::orgs::index(&ctx, false).unwrap();
+    let mut plain = index.orgs[0].clone();
+    plain.id = "9000-9".into();
+    plain.name = "Plain Example Clinic".into();
+    plain.fhir_base = "http://fhir.example.org/api/FHIR/R4".into();
+    plain.address = plain.fhir_base.clone();
+    index.orgs.push(plain);
+    mychart::fsutil::write_private(
+        &mychart::orgs::index_path(&ctx.cache_dir),
+        &serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    let Err(e) = commands::auth::run(
+        &ctx,
+        &AuthCmd::Login(LoginArgs {
+            org: "9000-9".into(),
+            label: None,
+            no_browser: true,
+            timeout: 1,
+        }),
+    ) else {
+        panic!("a sign-in started over plain http")
+    };
+    assert_eq!(e.exit_code(), 2);
+    assert!(e.to_string().contains("only https"), "{e}");
 }

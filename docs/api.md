@@ -231,7 +231,12 @@ range requests, so a failed download starts over.
   mychart records as an `unsupported` skip and goes on.
 - **Next links** are absolute URLs on the server's own spelling of the host,
   which can differ in case from the directory's; mychart compares origins
-  without case and follows no link to another host.
+  without case and follows no link to another host. An attachment URL on
+  another host is a `no_file` skip; the token is not sent there.
+- **Transient failures**: mychart tries a request again, twice, when it does
+  not arrive or answers 429, 500, 502, 503 or 504, waiting `Retry-After` (at
+  most 30 seconds). A 200 whose body is not FHIR JSON (a maintenance page)
+  is an `upstream` skip, as is a search entry that is not a resource.
 - **The sandbox** is shared and refreshed weekly: "The Sandbox is refreshed
   every Sunday at approximately 8:00 PM Central Time"; a new app syncs to it
   in about an hour. Its test patients (`fhircamila`, `fhirderrick`,

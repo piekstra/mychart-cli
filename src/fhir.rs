@@ -90,7 +90,7 @@ pub trait Bearer {
 pub enum Failure {
     /// The sign-in no longer works: stop.
     Auth(CliError),
-    /// The network or the server is unusable: stop.
+    /// The network, the server or this machine is unusable: stop.
     Fatal(CliError),
     /// This request was refused; the next may work.
     Skip { code: &'static str, reason: String },
@@ -173,7 +173,9 @@ impl<'a, T: Transport> Fhir<'a, T> {
         Ok(format!("{}/{}", self.base, path.trim_start_matches('/')))
     }
 
-    /// One GET with the token, retrying 429 and 503 within `Retry-After`.
+    /// One GET with the token. A request that does not arrive, a 429 and a
+    /// 5xx are tried again, twice, within `Retry-After`: every request is a
+    /// read, so a repeat is harmless.
     pub fn get(&self, path: &str, accept: &str) -> Result<HttpResponse, CliError> {
         let url = self.url(path)?;
         pk_cli_core::transport::require_secure_url(&url)?;
@@ -183,8 +185,16 @@ impl<'a, T: Transport> Fhir<'a, T> {
                 .header("Accept", accept)
                 .header("Authorization", format!("Bearer {}", self.bearer.token()?))
                 .user_agent(self.user_agent.0, self.user_agent.1);
-            let resp = block_on(self.t.send(req))?;
-            if (resp.status == 429 || resp.status == 503) && attempt < RETRIES {
+            let resp = match block_on(self.t.send(req)) {
+                Ok(resp) => resp,
+                Err(e) if attempt < RETRIES && !e.is_auth() => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_secs(attempt as u64));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if matches!(resp.status, 429 | 500 | 502 | 503 | 504) && attempt < RETRIES {
                 attempt += 1;
                 let wait = resp
                     .header_value("retry-after")
@@ -199,7 +209,26 @@ impl<'a, T: Transport> Fhir<'a, T> {
         }
     }
 
-    fn checked(&self, path: &str, accept: &str) -> Result<HttpResponse, Failure> {
+    /// A GET whose failure is the caller's to record and go past: a URL on
+    /// another server (skipped as `off_origin`, the token not sent), a
+    /// refusal by status. Only the sign-in, the network or this machine
+    /// failing stops the caller.
+    fn checked(
+        &self,
+        path: &str,
+        accept: &str,
+        off_origin: &'static str,
+    ) -> Result<HttpResponse, Failure> {
+        if self.url(path).is_err() {
+            return Err(Failure::Skip {
+                code: off_origin,
+                reason: format!(
+                    "{} is not this organization's server ({}); the sign-in is not sent there",
+                    origin(path).unwrap_or_else(|| "the URL".into()),
+                    origin(&self.base).unwrap_or_default()
+                ),
+            });
+        }
         let resp = self.get(path, accept)?;
         if resp.is_success() {
             return Ok(resp);
@@ -207,15 +236,16 @@ impl<'a, T: Transport> Fhir<'a, T> {
         Err(status_failure(&resp))
     }
 
-    /// One resource by `Type/id`.
+    /// One resource by `Type/id`. A body that is not FHIR JSON (a
+    /// maintenance page) is a skip.
     pub fn read(&self, path: &str) -> Result<RawResource, Failure> {
-        let resp = self.checked(path, "application/fhir+json")?;
-        Ok(RawResource::parse(&resp.body)?)
+        let resp = self.checked(path, "application/fhir+json", "not_found")?;
+        parsed(&resp.body)
     }
 
     /// A `Binary` as a FHIR resource (`data` in base64).
     pub fn binary(&self, reference: &str) -> Result<RawResource, Failure> {
-        let resp = self.checked(reference, "application/fhir+json")?;
+        let resp = self.checked(reference, "application/fhir+json", "no_file")?;
         if resp.body.len() > MAX_LINE_BYTES {
             return Err(Failure::Skip {
                 code: "too_large",
@@ -225,7 +255,7 @@ impl<'a, T: Transport> Fhir<'a, T> {
                 ),
             });
         }
-        let r = RawResource::parse(&resp.body)?;
+        let r = parsed(&resp.body)?;
         if r.resource_type != "Binary" {
             return Err(Failure::Skip {
                 code: "upstream",
@@ -257,7 +287,7 @@ impl<'a, T: Transport> Fhir<'a, T> {
                 summary.truncated = true;
                 break;
             }
-            let resp = self.checked(&url, "application/fhir+json")?;
+            let resp = self.checked(&url, "application/fhir+json", "upstream")?;
             summary.pages += 1;
             let page: Page = serde_json::from_str(&resp.body).map_err(|e| Failure::Skip {
                 code: "upstream",
@@ -271,7 +301,10 @@ impl<'a, T: Transport> Fhir<'a, T> {
             }
             for entry in page.entry {
                 let Some(raw) = entry.resource else { continue };
-                let r = RawResource::parse(raw.get())?;
+                let Ok(r) = RawResource::parse(raw.get()) else {
+                    summary.malformed += 1;
+                    continue;
+                };
                 let outcome = entry.search.as_ref().and_then(|s| s.mode.as_deref())
                     == Some("outcome")
                     || (r.resource_type == "OperationOutcome"
@@ -308,6 +341,16 @@ pub struct SearchSummary {
     pub pages: usize,
     pub outcomes: Vec<String>,
     pub truncated: bool,
+    /// Entries left out because they were not FHIR resources.
+    pub malformed: usize,
+}
+
+/// A response body as a resource; one that is not FHIR JSON is a skip.
+fn parsed(body: &str) -> Result<RawResource, Failure> {
+    RawResource::parse(body).map_err(|e| Failure::Skip {
+        code: "upstream",
+        reason: e.message().to_string(),
+    })
 }
 
 #[derive(Deserialize)]

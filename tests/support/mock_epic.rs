@@ -70,6 +70,11 @@ pub struct State {
     /// bare type.
     pub refuse: Vec<(String, u16)>,
     pub page_size: usize,
+    /// Answers that replace a read's (`Binary/b1`, `Practitioner/p1`):
+    /// a status and a body, for the given number of requests.
+    pub faults: Vec<Fault>,
+    /// Requests per FHIR path read or searched (`Binary/b1`, `Observation`).
+    pub hits: HashMap<String, usize>,
     counter: u64,
     /// Per process, so a token from an earlier mock is unknown to this one.
     salt: u32,
@@ -79,6 +84,35 @@ impl State {
     fn next(&mut self, prefix: &str) -> String {
         self.counter += 1;
         format!("{prefix}{:08x}{:016}", self.salt, self.counter)
+    }
+}
+
+pub struct Fault {
+    pub path: String,
+    pub status: u16,
+    pub body: String,
+    pub times: usize,
+}
+
+impl Fault {
+    /// `times` HTTP 500s for `path`, each saying to retry at once.
+    pub fn failing(path: &str, times: usize) -> Self {
+        Fault {
+            path: path.into(),
+            status: 500,
+            body: "<html><body>Internal error</body></html>".into(),
+            times,
+        }
+    }
+
+    /// A 200 that is not FHIR JSON (a maintenance page), every time.
+    pub fn not_fhir(path: &str) -> Self {
+        Fault {
+            path: path.into(),
+            status: 200,
+            body: "<html><body>Down for maintenance</body></html>".into(),
+            times: usize::MAX,
+        }
     }
 }
 
@@ -111,6 +145,8 @@ impl MockEpic {
                 ("Media".into(), 403),
             ],
             page_size: 2,
+            faults: Vec::new(),
+            hits: HashMap::new(),
             counter: 0,
             salt: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -632,6 +668,22 @@ fn fhir(
     };
     let patient = issued.patient.clone();
     let rest = req.path.trim_start_matches("/api/FHIR/R4/");
+    let mut st = st;
+    *st.hits.entry(rest.to_string()).or_insert(0) += 1;
+    if let Some(f) = st.faults.iter_mut().find(|f| f.path == rest && f.times > 0) {
+        f.times -= 1;
+        let (status, body) = (f.status, f.body.clone());
+        drop(st);
+        return respond(
+            stream,
+            status,
+            &[
+                ("Content-Type", "text/html".into()),
+                ("Retry-After", "0".into()),
+            ],
+            &body,
+        );
+    }
     let mut segs = rest.splitn(2, '/');
     let kind = segs.next().unwrap_or_default().to_string();
     let id = segs.next().map(str::to_string);
