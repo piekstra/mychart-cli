@@ -331,7 +331,7 @@ fn status(ctx: &Ctx) -> Result<(), CliError> {
                         "usable": usable(r),
                         "renewable": r.pointer("/status/renewable").cloned().unwrap_or(false.into()),
                         "token_expires": r.pointer("/status/expires_at").cloned().unwrap_or_default(),
-                        "refused": r.pointer("/status/refused_at").cloned().unwrap_or_default(),
+                        "refused_at": r.pointer("/status/refused_at").cloned().unwrap_or_default(),
                     })
                 })
                 .collect();

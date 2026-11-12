@@ -351,19 +351,30 @@ fn mark_refused(creds: &dyn Vault, ctx: &Context, s: &mut Session) -> Result<i64
     Ok(at)
 }
 
-/// Record a refusal of a token the organization had just issued: the
-/// access itself has ended.
-pub fn refuse(creds: &dyn Vault, lock: &RefreshLock, ctx: &Context) -> CliError {
+/// Record a refusal of `token`, which the organization had just issued:
+/// the access itself has ended. Only while the Keychain still holds that
+/// token: a process that stored a newer one meanwhile keeps it unmarked,
+/// and this run stops with a plain auth error.
+pub fn refuse(creds: &dyn Vault, lock: &RefreshLock, ctx: &Context, token: &str) -> CliError {
     let marked = lock.renew(
         || load(creds, ctx),
-        |latest| latest.refused_at.is_none(),
+        |latest| latest.refused_at.is_none() && latest.access_token == token,
         |mut latest| {
             mark_refused(creds, ctx, &mut latest)?;
             Ok(latest)
         },
     );
     match marked {
-        Ok(s) => refused(ctx, s.refused_at.unwrap_or_else(now)),
+        Ok(s) => match s.refused_at {
+            Some(at) => refused(ctx, at),
+            None => CliError::Auth(format!(
+                "the organization refused the token it had just issued for patient {} at {}; \
+                 another process has stored a newer one",
+                ctx.display(),
+                ctx.organization_name
+            ))
+            .with_remedy("run the command again"),
+        },
         Err(e) => e,
     }
 }
@@ -495,7 +506,7 @@ impl<T: Transport> crate::fhir::Bearer for Live<'_, T> {
 
     fn refused(&self, token: &str) -> Option<Result<String, CliError>> {
         if self.reissued.borrow().as_deref() == Some(token) {
-            return Some(Err(refuse(self.vault, self.lock, self.context)));
+            return Some(Err(refuse(self.vault, self.lock, self.context, token)));
         }
         Some(
             renew_refused(self.t, self.vault, self.lock, self.context, token).map(|s| {

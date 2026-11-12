@@ -920,3 +920,57 @@ fn an_organization_without_https_is_refused_before_the_network() {
     assert_eq!(e.exit_code(), 2);
     assert!(e.to_string().contains("only https"), "{e}");
 }
+
+#[test]
+fn a_401_to_a_token_another_process_replaced_uses_the_new_one_without_a_grant() {
+    let mock = MockEpic::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let c = ctx.contexts().unwrap().remove(0);
+    let t = commands::transport().unwrap();
+    let held = stored(&ctx, SELF_PATIENT).access_token;
+    let grants = mock.get(|st| st.jwt_bearer_grants);
+
+    // This process was refused an older token; the Keychain holds a newer one.
+    let s =
+        session::renew_refused(&t, ctx.vault.as_ref(), &ctx.lock, &c, "an-older-token").unwrap();
+    assert_eq!(s.access_token, held);
+    assert_eq!(mock.get(|st| st.jwt_bearer_grants), grants);
+
+    // Nor is the newer token marked when the older one was just issued.
+    let e = session::refuse(ctx.vault.as_ref(), &ctx.lock, &c, "an-older-token");
+    assert_eq!(e.exit_code(), 3);
+    let kept = stored(&ctx, SELF_PATIENT);
+    assert!(kept.refused_at.is_none());
+    assert!(kept.usable(session::now()));
+}
+
+#[test]
+fn a_401_with_no_way_to_renew_marks_the_sign_in_refused() {
+    let mock = MockEpic::start();
+    mock.set(|st| st.offer_registration = false);
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), &mock, |_| {});
+    login(&ctx, "adult1");
+    let s = stored(&ctx, SELF_PATIENT);
+    assert!(!s.renewable());
+    let c = ctx.contexts().unwrap().remove(0);
+    let t = commands::transport().unwrap();
+
+    let Err(e) = session::renew_refused(&t, ctx.vault.as_ref(), &ctx.lock, &c, &s.access_token)
+    else {
+        panic!("a refused token that cannot be renewed returned a session")
+    };
+    assert_eq!(e.exit_code(), 3);
+    assert!(stored(&ctx, SELF_PATIENT).refused_at.is_some());
+
+    // Not fresh and not renewable: refused before any request.
+    let reads: usize = mock.get(|st| st.hits.values().sum());
+    let Err(e) = session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &c) else {
+        panic!("a refused sign-in returned a session")
+    };
+    assert_eq!(e.exit_code(), 3);
+    assert!(e.message().contains("refused it on"), "{e}");
+    assert_eq!(mock.get(|st| st.hits.values().sum::<usize>()), reads);
+}

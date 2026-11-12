@@ -100,13 +100,15 @@ expiry; when the period ends the grant fails and mychart asks for a new
 `auth login` (exit 3).
 
 A server can refuse an access token before its `expires_in` is up (a 401:
-revoked, or forgotten after a restart). mychart then renews it once, with
-the JWT-bearer grant under the refresh lock, and asks again; another
-process that renewed meanwhile has stored a different token, which is used
-instead. When the grant is refused, or the server answers 401 to the token
-it has just issued, the Keychain item records `refused_at`: `auth status`
-shows the sign-in as not authenticated (with `refused_at`), the refused
-token is not sent again, and the next command tries one renewal grant
+revoked, or forgotten after a restart). mychart then renews it once under
+the refresh lock (the JWT-bearer grant, or the refresh token when there is
+no dynamic client) and asks again; another process that renewed meanwhile
+has stored a different token, which is used instead. When the grant is
+refused, the sign-in has no way to renew, or the server answers 401 to the
+token it has just issued (and the Keychain still holds that token), the
+Keychain item records `refused_at`: `auth status` shows the sign-in as not
+authenticated (`status.refused_at` in `--json`, a `refused_at` column in
+the table), the refused token is not sent again, and the next command tries one renewal grant
 before any FHIR request, which clears it on success, so a refusal that
 passes does not cost a sign-in.
 
