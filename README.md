@@ -20,6 +20,34 @@ mychart api GET Patient/<id> --patient adult1
 `mychart` only reads. Records go where you send them; nothing is sent
 anywhere else.
 
+## What this app does with your records
+
+`mychart` runs on your own computer. There is no mychart server, account
+or company between you and your health system: each household registers
+its own copy of the app with Epic.
+
+- **What it reads.** The records your health system lets your MyChart
+  account share with apps, over Epic's patient-access FHIR API: allergies,
+  conditions, medications, immunizations, lab results and vital signs,
+  procedures, encounters, care plans and goals, clinical notes, and the
+  reports and scanned documents attached to them. For a child, only what
+  your proxy access in MyChart allows. MyChart may let you choose what to
+  share when you sign in.
+- **What it changes.** Nothing. It never writes to your health system.
+- **Where records go.** To the computer it runs on: printed to its output
+  or saved to a file or folder you name. It sends them to no other server,
+  sells and shares nothing, and has no analytics or tracking.
+- **What it keeps.** Your sign-in (access tokens and a key made on your
+  computer) in the macOS Keychain, and a list of who is signed in (patient
+  ids and labels, no record contents) under `~/.config/mychart/`.
+- **Ending access.** `mychart auth logout` deletes the stored sign-in.
+  MyChart's "Manage My Linked Apps and Devices" ends the app's access at
+  your health system. Access also ends on its own after the period you
+  chose in MyChart.
+
+The source code is public in this repository, and anyone can read what it
+does.
+
 ## Before the first sign-in
 
 Each household registers its own free patient app with Epic and gives
