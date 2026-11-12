@@ -110,7 +110,9 @@ Keychain item records `refused_at`: `auth status` shows the sign-in as not
 authenticated (`status.refused_at` in `--json`, a `refused_at` column in
 the table), the refused token is not sent again, and the next command tries one renewal grant
 before any FHIR request, which clears it on success, so a refusal that
-passes does not cost a sign-in.
+passes does not cost a sign-in. A sign-in with no way to renew (no
+dynamic client and no refresh token) stays refused, exit 3, until `auth
+login`.
 
 Epic's guidelines: an app holding persistent access without a BAA "informs
 the patient user of the period of time for which the app is seeking

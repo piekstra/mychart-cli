@@ -46,8 +46,9 @@ pub struct Session {
     pub signed_in_at: i64,
     /// Unix seconds: when the organization last refused this sign-in (a
     /// renewal grant refused, or a 401 with no renewal that helped). Its
-    /// token is not sent again, `auth status` shows it unusable, and the
-    /// next command tries one renewal grant, which clears it on success.
+    /// token is not sent again and `auth status` shows it unusable. When it
+    /// is renewable, the next command tries one renewal grant, which clears
+    /// it on success; otherwise it stays refused until `auth login`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused_at: Option<i64>,
 }
