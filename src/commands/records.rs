@@ -108,6 +108,8 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
         Some(dir) => {
             // The previous export is replaced only by a finished stream, its
             // trailer written and synced; one cut short leaves it whole.
+            // pk-med-records' create_export_file renames an empty file into
+            // place first; this moves to it once it commits on success.
             let mut staged = crate::fsutil::Staged::create(&dir.join(pk_med_records::EXPORT_FILE))?;
             let mut out = std::io::BufWriter::new(staged.file());
             let mut w = RecordsWriter::start(&mut out, &head)?;

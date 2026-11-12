@@ -44,20 +44,37 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fhir_user: Option<String>,
     pub signed_in_at: i64,
+    /// Unix seconds: when the organization last refused this sign-in (a
+    /// renewal grant refused, or a 401 with no renewal that helped). Its
+    /// token is not sent again and `auth status` shows it unusable. When it
+    /// is renewable, the next command tries one renewal grant, which clears
+    /// it on success; otherwise it stays refused until `auth login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_at: Option<i64>,
 }
 
 impl Session {
+    /// Whether the stored access token may be sent: unexpired and not
+    /// refused.
     pub fn is_fresh(&self, now: i64) -> bool {
-        self.expires_at - EXPIRY_SKEW_SECS > now
+        self.refused_at.is_none() && self.expires_at - EXPIRY_SKEW_SECS > now
     }
 
-    /// Whether this session can get a new access token without a sign-in.
+    /// Whether this session holds a way to get a new access token without a
+    /// sign-in.
     pub fn renewable(&self) -> bool {
         self.refresh_token.is_some()
             || (self.dynamic_client_id.is_some() && self.private_key.is_some())
     }
 
+    /// What `auth status` calls authenticated: not refused, and a token
+    /// that is fresh or can be renewed.
+    pub fn usable(&self, now: i64) -> bool {
+        self.refused_at.is_none() && (self.is_fresh(now) || self.renewable())
+    }
+
     pub fn apply(&mut self, t: &TokenResponse, now: i64) {
+        self.refused_at = None;
         self.access_token = t.access_token.clone();
         self.expires_at = now + t.expires_in.unwrap_or(3600);
         if let Some(rt) = &t.refresh_token {
@@ -286,44 +303,127 @@ pub fn access_token<T: Transport>(
         return Ok(stored);
     }
     if !stored.renewable() {
-        return Err(expired(ctx, "it was stored without a way to renew it"));
+        return Err(match stored.refused_at {
+            Some(at) => refused(ctx, at),
+            None => expired(ctx, "it was stored without a way to renew it"),
+        });
     }
+    // A refused sign-in is not fresh, so it gets one renewal grant here.
     lock.renew(
         || load(creds, ctx),
         |latest| !latest.is_fresh(now()),
+        |latest| grant(t, creds, ctx, latest),
+    )
+}
+
+/// A new access token after the organization answered 401 to `refused`,
+/// under the refresh lock: a process that renewed meanwhile has stored a
+/// different token, and that one is used instead.
+pub fn renew_refused<T: Transport>(
+    t: &T,
+    creds: &dyn Vault,
+    lock: &RefreshLock,
+    ctx: &Context,
+    refused_token: &str,
+) -> Result<Session, CliError> {
+    let latest = lock.renew(
+        || load(creds, ctx),
+        |latest| latest.refused_at.is_none() && latest.access_token == refused_token,
         |mut latest| {
-            let now = now();
-            let key = match &latest.private_key {
-                Some(k) => Some(SigningKey::from_stored(k)?),
-                None => None,
-            };
-            // The dynamic client's JWT grant first: a refresh token from the
-            // code exchange was issued to the app's client id, not to it.
-            let granted = match (&latest.dynamic_client_id, &key, &latest.refresh_token) {
-                (Some(dynamic), Some(key), _) => {
-                    smart::jwt_bearer_grant(t, &latest.token_endpoint, dynamic, key, now)
-                }
-                (_, _, Some(rt)) => smart::refresh_grant(
-                    t,
-                    &latest.token_endpoint,
-                    &latest.client_id,
-                    rt,
-                    None,
-                    now,
-                ),
-                _ => return Err(expired(ctx, "it was stored without a way to renew it")),
+            if !latest.renewable() {
+                let at = mark_refused(creds, ctx, &mut latest)?;
+                return Err(refused(ctx, at));
             }
-            .map_err(|e| {
-                if e.is_auth() {
-                    expired(ctx, e.message())
-                } else {
-                    e
-                }
-            })?;
-            latest.apply(&granted, now);
-            vault::set_json(creds, &ctx.account(), &latest)?;
+            grant(t, creds, ctx, latest)
+        },
+    )?;
+    match latest.refused_at {
+        Some(at) => Err(refused(ctx, at)),
+        None => Ok(latest),
+    }
+}
+
+/// Record that the organization refused this sign-in, so `auth status`
+/// says so and nothing is sent with it again. Called under the lock.
+fn mark_refused(creds: &dyn Vault, ctx: &Context, s: &mut Session) -> Result<i64, CliError> {
+    let at = now();
+    s.refused_at = Some(at);
+    vault::set_json(creds, &ctx.account(), s)?;
+    Ok(at)
+}
+
+/// Record a refusal of `token`, which the organization had just issued:
+/// the access itself has ended. Only while the Keychain still holds that
+/// token: a process that stored a newer one meanwhile keeps it unmarked,
+/// and this run stops with a plain auth error.
+pub fn refuse(creds: &dyn Vault, lock: &RefreshLock, ctx: &Context, token: &str) -> CliError {
+    let marked = lock.renew(
+        || load(creds, ctx),
+        |latest| latest.refused_at.is_none() && latest.access_token == token,
+        |mut latest| {
+            mark_refused(creds, ctx, &mut latest)?;
             Ok(latest)
         },
+    );
+    match marked {
+        Ok(s) => match s.refused_at {
+            Some(at) => refused(ctx, at),
+            None => CliError::Auth(format!(
+                "the organization refused the token it had just issued for patient {} at {}; \
+                 another process has stored a newer one",
+                ctx.display(),
+                ctx.organization_name
+            ))
+            .with_remedy("run the command again"),
+        },
+        Err(e) => e,
+    }
+}
+
+/// One renewal grant for `latest`, stored before it returns. A grant the
+/// organization refuses marks the sign-in refused.
+fn grant<T: Transport>(
+    t: &T,
+    creds: &dyn Vault,
+    ctx: &Context,
+    mut latest: Session,
+) -> Result<Session, CliError> {
+    let now = now();
+    let key = match &latest.private_key {
+        Some(k) => Some(SigningKey::from_stored(k)?),
+        None => None,
+    };
+    // The dynamic client's JWT grant first: a refresh token from the
+    // code exchange was issued to the app's client id, not to it.
+    let granted = match (&latest.dynamic_client_id, &key, &latest.refresh_token) {
+        (Some(dynamic), Some(key), _) => {
+            smart::jwt_bearer_grant(t, &latest.token_endpoint, dynamic, key, now)
+        }
+        (_, _, Some(rt)) => {
+            smart::refresh_grant(t, &latest.token_endpoint, &latest.client_id, rt, None, now)
+        }
+        _ => return Err(expired(ctx, "it was stored without a way to renew it")),
+    };
+    let granted = match granted {
+        Ok(g) => g,
+        Err(e) if e.is_auth() => {
+            mark_refused(creds, ctx, &mut latest)?;
+            return Err(expired(ctx, e.message()));
+        }
+        Err(e) => return Err(e),
+    };
+    latest.apply(&granted, now);
+    vault::set_json(creds, &ctx.account(), &latest)?;
+    Ok(latest)
+}
+
+fn refused(ctx: &Context, at: i64) -> CliError {
+    expired(
+        ctx,
+        &format!(
+            "the organization refused it on {}",
+            crate::commands::rfc3339(at)
+        ),
     )
 }
 
@@ -352,6 +452,8 @@ pub struct Live<'a, T: Transport> {
     lock: &'a RefreshLock,
     context: &'a Context,
     session: std::cell::RefCell<Session>,
+    /// The token renewed after a 401, so a 401 to it too ends the sign-in.
+    reissued: std::cell::RefCell<Option<String>>,
 }
 
 impl<'a, T: Transport> Live<'a, T> {
@@ -383,6 +485,7 @@ impl<'a, T: Transport> Live<'a, T> {
             lock,
             context,
             session: std::cell::RefCell::new(session),
+            reissued: std::cell::RefCell::new(None),
         })
     }
 
@@ -400,6 +503,20 @@ impl<T: Transport> crate::fhir::Bearer for Live<'_, T> {
             *self.session.borrow_mut() = renewed;
         }
         Ok(self.session.borrow().access_token.clone())
+    }
+
+    fn refused(&self, token: &str) -> Option<Result<String, CliError>> {
+        if self.reissued.borrow().as_deref() == Some(token) {
+            return Some(Err(refuse(self.vault, self.lock, self.context, token)));
+        }
+        Some(
+            renew_refused(self.t, self.vault, self.lock, self.context, token).map(|s| {
+                let token = s.access_token.clone();
+                *self.reissued.borrow_mut() = Some(token.clone());
+                *self.session.borrow_mut() = s;
+                token
+            }),
+        )
     }
 }
 

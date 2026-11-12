@@ -97,13 +97,13 @@ pub fn transport() -> Result<BlockingTransport, CliError> {
     BlockingTransport::new()
 }
 
-/// RFC 3339 for unix seconds.
 /// A DTO as JSON for stdout; a failure is an error with an exit code, never
 /// a `null` that reads as success.
 pub fn to_json<T: serde::Serialize>(dto: &T) -> Result<serde_json::Value, CliError> {
     serde_json::to_value(dto).map_err(|e| CliError::Other(format!("serializing the output: {e}")))
 }
 
+/// RFC 3339 for unix seconds.
 pub fn rfc3339(secs: i64) -> String {
     pk_cli_core::dates::fmt_rfc3339(secs)
 }

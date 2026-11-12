@@ -140,6 +140,7 @@ fn login(ctx: &Ctx, args: &LoginArgs) -> Result<(), CliError> {
         patient: patient.clone(),
         fhir_user: fhir_user.clone(),
         signed_in_at: at,
+        refused_at: None,
     };
     session.apply(&granted, at);
 
@@ -269,12 +270,15 @@ pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
     v["fhir_base"] = c.fhir_base.clone().into();
     v["signed_in_at"] = c.signed_in_at.clone().into();
     if let Some(s) = session {
-        let usable = s.is_fresh(now()) || s.renewable();
+        let usable = s.usable(now());
         v["status"] = json!({
             "authenticated": usable,
             "renewable": s.renewable(),
             "expires_at": rfc3339(s.expires_at),
         });
+        if let Some(at) = s.refused_at {
+            v["status"]["refused_at"] = rfc3339(at).into();
+        }
     }
     v
 }
@@ -299,9 +303,7 @@ fn status(ctx: &Ctx) -> Result<(), CliError> {
     for c in &contexts {
         let s = stored(ctx, c)?;
         any_stored |= s.is_some();
-        any_usable |= s
-            .as_ref()
-            .is_some_and(|s| s.is_fresh(now()) || s.renewable());
+        any_usable |= s.as_ref().is_some_and(|s| s.usable(now()));
         let mut row = patient_dto(c, s.as_ref());
         row["credential_in_keychain"] = s.is_some().into();
         rows.push(row);
@@ -329,6 +331,7 @@ fn status(ctx: &Ctx) -> Result<(), CliError> {
                         "usable": usable(r),
                         "renewable": r.pointer("/status/renewable").cloned().unwrap_or(false.into()),
                         "token_expires": r.pointer("/status/expires_at").cloned().unwrap_or_default(),
+                        "refused_at": r.pointer("/status/refused_at").cloned().unwrap_or_default(),
                     })
                 })
                 .collect();

@@ -22,6 +22,9 @@ pub const PAGE_CAP: usize = 100;
 pub const MAX_LINE_BYTES: usize = pk_med_records::MAX_LINE_BYTES;
 const RETRIES: usize = 2;
 const SEND_RETRIES: usize = 1;
+/// 401s handed to `Bearer::refused`: the first renews, the second (to the
+/// renewed token) ends the sign-in.
+const REFUSALS: usize = 2;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
 pub use pk_med_fhir::{describe_json_error, RawResource};
@@ -29,6 +32,13 @@ pub use pk_med_fhir::{describe_json_error, RawResource};
 /// Supplies the bearer token, renewing it when it is due.
 pub trait Bearer {
     fn token(&self) -> Result<String, CliError>;
+
+    /// The organization answered 401 to `token`: a new token to ask once
+    /// more with, the error to stop with, or `None` (no way to renew; the
+    /// 401 is the answer).
+    fn refused(&self, _token: &str) -> Option<Result<String, CliError>> {
+        None
+    }
 }
 
 /// How one request failed, for a caller that records a skip and goes on.
@@ -134,18 +144,19 @@ impl<'a, T: Transport> Fhir<'a, T> {
     }
 
     /// One GET with the token. Every request is a read, so a repeat is
-    /// harmless: a 429 or 5xx is tried again twice within `Retry-After`, and
-    /// a request that got no answer once (the transport's own timeout is a
-    /// minute, so a second wait is the most worth spending). Each retry is
-    /// reported through the note.
+    /// harmless: a 429 or 5xx is tried again twice within `Retry-After`, a
+    /// request that got no answer once (the transport's own timeout is a
+    /// minute, so a second wait is the most worth spending), and a 401 once
+    /// with a renewed token. Each retry is reported through the note.
     pub fn get(&self, path: &str, accept: &str) -> Result<HttpResponse, CliError> {
         let url = self.url(path)?;
         pk_cli_core::transport::require_secure_url(&url)?;
-        let (mut attempt, mut unanswered) = (0, 0);
+        let (mut attempt, mut unanswered, mut refusals) = (0, 0, 0);
         loop {
+            let token = self.bearer.token()?;
             let req = HttpRequest::get(url.clone())
                 .header("Accept", accept)
-                .header("Authorization", format!("Bearer {}", self.bearer.token()?))
+                .header("Authorization", format!("Bearer {token}"))
                 .user_agent(self.user_agent.0, self.user_agent.1);
             let resp = match block_on(self.t.send(req)) {
                 Ok(resp) => resp,
@@ -157,6 +168,23 @@ impl<'a, T: Transport> Fhir<'a, T> {
                 }
                 Err(e) => return Err(e),
             };
+            // A 401: the token was revoked or forgotten before its time.
+            // Renew it once and ask again; a 401 to the renewed one ends the
+            // sign-in (the bearer records that).
+            if resp.status == 401 && refusals < REFUSALS {
+                refusals += 1;
+                match self.bearer.refused(&token) {
+                    None => return Ok(resp),
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok(_)) => {
+                        self.tell(format!(
+                            "{} refused the access token (HTTP 401); renewed it, asking again",
+                            origin(&url).unwrap_or_default()
+                        ));
+                        continue;
+                    }
+                }
+            }
             if matches!(resp.status, 429 | 500 | 502 | 503 | 504) && attempt < RETRIES {
                 attempt += 1;
                 let wait = resp
@@ -433,6 +461,93 @@ mod tests {
         fn token(&self) -> Result<String, CliError> {
             Ok("t".into())
         }
+    }
+
+    /// Answers in order, keeping each request's Authorization header.
+    struct Seen(
+        RefCell<Vec<Result<HttpResponse, CliError>>>,
+        RefCell<Vec<String>>,
+    );
+
+    impl Transport for Seen {
+        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, CliError> {
+            let auth = req
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            self.1.borrow_mut().push(auth);
+            self.0.borrow_mut().remove(0)
+        }
+    }
+
+    /// Renews `t1` to `t2` on a 401, and ends the sign-in on a 401 to `t2`.
+    struct Renewing(RefCell<String>, RefCell<usize>);
+
+    impl Bearer for Renewing {
+        fn token(&self) -> Result<String, CliError> {
+            Ok(self.0.borrow().clone())
+        }
+        fn refused(&self, token: &str) -> Option<Result<String, CliError>> {
+            *self.1.borrow_mut() += 1;
+            if token == "t2" {
+                return Some(Err(CliError::Auth("the sign-in has ended".into())));
+            }
+            *self.0.borrow_mut() = "t2".into();
+            Some(Ok("t2".into()))
+        }
+    }
+
+    #[test]
+    fn a_refused_token_is_renewed_once_and_the_request_asked_again() {
+        let t = Seen(
+            RefCell::new(vec![
+                ok(401, "{}"),
+                ok(200, r#"{"resourceType":"Patient","id":"p1"}"#),
+            ]),
+            RefCell::new(Vec::new()),
+        );
+        let bearer = Renewing(RefCell::new("t1".into()), RefCell::new(0));
+        let notes = RefCell::new(Vec::new());
+        let note = |s: String| notes.borrow_mut().push(s);
+        let fhir = Fhir::new(&t, "https://fhir.example.org/r4", &bearer).with_note(&note);
+        let r = fhir.read("Patient/p1").unwrap();
+        assert_eq!(r.id, "p1");
+        assert_eq!(*t.1.borrow(), ["Bearer t1", "Bearer t2"]);
+        assert_eq!(*bearer.1.borrow(), 1);
+        assert!(
+            notes.borrow()[0].contains("refused the access token"),
+            "{:?}",
+            notes.borrow()
+        );
+    }
+
+    #[test]
+    fn a_refused_renewed_token_ends_the_sign_in() {
+        let t = Seen(
+            RefCell::new(vec![ok(401, "{}"), ok(401, "{}")]),
+            RefCell::new(Vec::new()),
+        );
+        let bearer = Renewing(RefCell::new("t1".into()), RefCell::new(0));
+        let fhir = Fhir::new(&t, "https://fhir.example.org/r4", &bearer);
+        let Err(Failure::Auth(e)) = fhir.read("Patient/p1") else {
+            panic!("a second 401 did not end the sign-in")
+        };
+        assert_eq!(e.exit_code(), 3);
+        assert_eq!(t.1.borrow().len(), 2);
+        assert_eq!(*bearer.1.borrow(), 2);
+    }
+
+    #[test]
+    fn a_bearer_that_cannot_renew_takes_the_401_as_the_answer() {
+        let t = Seen(RefCell::new(vec![ok(401, "{}")]), RefCell::new(Vec::new()));
+        let fhir = Fhir::new(&t, "https://fhir.example.org/r4", &Token);
+        let Err(Failure::Auth(e)) = fhir.read("Patient/p1") else {
+            panic!("a 401 was not an auth failure")
+        };
+        assert_eq!(e.exit_code(), 3);
+        assert_eq!(t.1.borrow().len(), 1);
     }
 
     fn ok(status: u16, body: &str) -> Result<HttpResponse, CliError> {

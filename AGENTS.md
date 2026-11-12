@@ -18,21 +18,26 @@ the `pk-cli-*` crates from [cli-common](https://github.com/piekstra/cli-common).
 | `src/key.rs` | the per-install RSA key and its RS384 client assertion |
 | `src/session.rs` | the stored sign-in (`Session`), the patient index (`contexts.json`), `pick`, renewal under the refresh lock (`access_token`, `Live`) |
 | `src/vault.rs` | the Keychain behind a trait, so tests use memory |
+| `src/fsutil.rs` | owner-only files: written whole (`write_private`), or streamed and renamed on commit (`Staged`) |
 | `src/fhir.rs` | the request layer: reads, paged searches, `Binary`, retries, status to skip or error |
 | `src/export.rs` | Epic's search plan, the export order, and the types `--since` leaves unbounded |
 | `tests/support/mock_epic.rs` | a mock Epic organization on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | Epic's behaviour and traps, quoted; read before changing auth or export |
 
-The stream (`RecordsWriter`, `Header`, `Skip`, the trailer), the DTOs,
-`records-export/v1` and the export file are medical-common's
-`pk-med-records`; `RawResource`, `normalize_base` and `describe_json_error`
+The stream (`RecordsWriter`, `Header`, `Skip`, the trailer), the DTOs and
+`records-export/v1` are medical-common's `pk-med-records`; `RawResource`, `normalize_base` and `describe_json_error`
 are its `pk-med-fhir` (v0.1.0, pinned with cli-common v0.31.0, the tag it
 builds on). `src/smart.rs` and the request layer in `src/fhir.rs` stand in
 for `pk-med-smart` and `pk_med_fhir::FhirClient` until medical-common
 v0.2.0, which adds what an Epic export needs from the client: a token
 source that renews mid-export, a network failure told from a 5xx, retry
-notes and pages read around an unreadable entry. Move every `pk-cli-*` and
-`pk-med-*` together, so the build holds one copy of each crate.
+notes and pages read around an unreadable entry. `records.ndjson` is
+written through `fsutil::Staged`, renamed over the previous export only
+once its trailer is synced, until `pk-med-records`' `create_export_file`
+does the same (it renames the empty file into place first); unlike it,
+`Staged` replaces a symbolic link at the target rather than refusing one.
+Move every `pk-cli-*` and `pk-med-*` together, so the build holds one copy
+of each crate.
 
 ## Medical data
 
