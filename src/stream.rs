@@ -94,12 +94,16 @@ pub struct Trailer {
     pub error: Option<TrailerError>,
 }
 
-/// Why a stream stopped: piekstra-cli/1's error code and the exit code the
-/// CLI ended with.
+/// Why a stream stopped: piekstra-cli/1's error code (`CliError::code()`:
+/// `usage`, `auth`, `not_found`, `upstream`, `keychain`, `other`, ...; a
+/// reader takes an unknown one as a failure like any other) and the exit
+/// code the CLI ended with.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrailerError {
     pub code: String,
     pub message: String,
+    /// Always written by mychart; optional in records-stream/v1, as in
+    /// `pk_med_records::TrailerError`, so other producers' streams read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 }

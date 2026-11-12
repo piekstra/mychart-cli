@@ -265,6 +265,13 @@ pub fn patient_dto(c: &Context, session: Option<&Session>) -> Value {
     v
 }
 
+/// Whether a `patient_dto` row's stored sign-in can make requests.
+pub fn usable(row: &Value) -> bool {
+    row.pointer("/status/authenticated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// A context's stored session, or `None` when its Keychain item is gone.
 pub fn stored(ctx: &Ctx, c: &Context) -> Result<Option<Session>, CliError> {
     vault::get_json::<Session>(ctx.vault.as_ref(), &c.account())
@@ -305,7 +312,7 @@ fn status(ctx: &Ctx) -> Result<(), CliError> {
                         "patient": r["label"].as_str().unwrap_or(r["id"].as_str().unwrap_or_default()),
                         "organization": r["organization_name"],
                         "relationship": r["relationship"],
-                        "usable": r.pointer("/status/authenticated").cloned().unwrap_or(false.into()),
+                        "usable": usable(r),
                         "renewable": r.pointer("/status/renewable").cloned().unwrap_or(false.into()),
                         "token_expires": r.pointer("/status/expires_at").cloned().unwrap_or_default(),
                     })

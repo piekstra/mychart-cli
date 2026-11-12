@@ -136,6 +136,22 @@ fn a_sign_in_registers_the_install_and_renews_without_the_browser() {
     session::access_token(&t, ctx.vault.as_ref(), &ctx.lock, &contexts[0]).unwrap();
     assert_eq!(mock.get(|st| st.jwt_bearer_grants), 2);
 
+    // The profile's PatientContext: the Keychain account, never the token,
+    // and the stored sign-in's state under `status`.
+    let row = commands::auth::patient_dto(&contexts[0], Some(&stored(&ctx, SELF_PATIENT)));
+    assert_eq!(
+        row["session"],
+        format!("smart/{}/{SELF_PATIENT}", mock_epic::ORG_ID)
+    );
+    assert_eq!(row["kind"], "patient");
+    assert_eq!(row["relationship"], "self");
+    assert_eq!(row.pointer("/status/authenticated"), Some(&true.into()));
+    assert_eq!(row.pointer("/status/renewable"), Some(&true.into()));
+    assert!(commands::auth::usable(&row));
+    assert!(!row.to_string().contains(&renewed.access_token));
+    let bare = commands::auth::patient_dto(&contexts[0], None);
+    assert!(bare.get("status").is_none() && !commands::auth::usable(&bare));
+
     commands::patients::run(&ctx, &PatientsCmd::List { status: true }).unwrap();
     commands::auth::run(&ctx, &AuthCmd::Status).unwrap();
 }

@@ -233,7 +233,7 @@ pub fn normalize_base(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let split = rest.find('/').unwrap_or(rest.len());
+    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, path) = rest.split_at(split);
     format!(
         "{}://{}{path}",
@@ -487,6 +487,10 @@ mod tests {
         assert_eq!(
             normalize_base("http://127.0.0.1:9481/api/FHIR/R4"),
             "http://127.0.0.1:9481/api/FHIR/R4"
+        );
+        assert_eq!(
+            normalize_base("https://FHIR.Example.ORG?Q=X"),
+            "https://fhir.example.org?Q=X"
         );
         assert_eq!(normalize_base("not a url/"), "not a url");
     }
