@@ -1,67 +1,23 @@
-//! Owner-only files, written whole: a new temp file in the same directory,
-//! `0600`, renamed over the target, so a reader never sees half a file and
-//! nobody else on the machine can read it.
-//!
-//! The temp file's name is random and it is created with `create_new`
-//! (`O_EXCL`), so it can be neither a file someone else made first nor a
-//! symbolic link. The rename replaces a link at the target itself; it never
-//! writes through one.
+//! Owner-only files, through the family's one writer
+//! (`pk_cli_drive::private_file`): a temp file beside the target, created
+//! exclusively (`O_EXCL`) with mode `0600` and renamed over it. A reader
+//! never sees half a file, nobody else on the machine can read it, and a
+//! file or symbolic link planted at the temp name or the target never
+//! receives the bytes (a planted temp name makes the write fail instead).
 
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pk_cli_core::CliError;
-
-const TEMP_ATTEMPTS: usize = 8;
+use pk_cli_drive::private_file::{self, Replace};
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let fail =
-        |what: &str, e: std::io::Error| CliError::Other(format!("{what} {}: {e}", path.display()));
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     create_private_dir(dir)?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".into());
-    let (tmp, mut f) = create_temp(dir, &name).map_err(|e| fail("creating a file next to", e))?;
-    let result = (|| {
-        f.write_all(bytes).map_err(|e| fail("writing", e))?;
-        f.sync_all().map_err(|e| fail("writing", e))?;
-        drop(f);
-        std::fs::rename(&tmp, path).map_err(|e| fail("replacing", e))
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-/// A new owner-only file `.<name>.<random>.tmp` in `dir`.
-fn create_temp(dir: &Path, name: &str) -> std::io::Result<(PathBuf, File)> {
-    let mut last = None;
-    for _ in 0..TEMP_ATTEMPTS {
-        let mut suffix = [0u8; 8];
-        getrandom::fill(&mut suffix).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
-        let tmp = dir.join(format!(".{name}.{suffix}.tmp"));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        match opts.open(&tmp) {
-            Ok(f) => return Ok((tmp, f)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last.unwrap_or_else(|| std::io::Error::other("no free temporary name")))
+    private_file::write(path, bytes, Replace::Always)
+        .map_err(|e| CliError::Other(format!("writing {}: {e}", path.display())))
 }
 
 /// Create `dir` (and parents) owner-only.
@@ -117,21 +73,5 @@ mod tests {
         let meta = std::fs::symlink_metadata(&path).unwrap();
         assert!(meta.file_type().is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_temp_name_is_never_reused() {
-        let dir = tempfile::tempdir().unwrap();
-        let (a, _fa) = create_temp(dir.path(), "x").unwrap();
-        let (b, _fb) = create_temp(dir.path(), "x").unwrap();
-        assert_ne!(a, b);
-        // A planted link cannot be opened as the temp file.
-        let planted = dir.path().join(".x.planted.tmp");
-        std::os::unix::fs::symlink(dir.path().join("target"), &planted).unwrap();
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        assert!(opts.open(&planted).is_err());
-        assert!(!dir.path().join("target").exists());
     }
 }

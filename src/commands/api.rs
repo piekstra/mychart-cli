@@ -23,7 +23,8 @@ pub fn run(ctx: &Ctx, args: &ApiArgs) -> Result<(), CliError> {
     let c = ctx.signed_in(&args.who)?;
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
     fhir.url(&args.path)?;
     let resp = fhir.get(&args.path, "application/fhir+json")?;
     if !resp.is_success() {

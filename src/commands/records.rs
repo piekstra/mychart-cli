@@ -103,7 +103,8 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
     }
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
     let since = args.since.as_deref();
     let mut head = header(&c, since);
     head.organization.fhir_base = fhir.base().to_string();

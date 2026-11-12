@@ -19,6 +19,7 @@ pub const PAGE_CAP: usize = 100;
 /// The longest stream line (a Binary carries its document inline).
 pub const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const RETRIES: usize = 2;
+const SEND_RETRIES: usize = 1;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
 /// One resource as the server sent it, minified.
@@ -126,6 +127,7 @@ pub struct Fhir<'a, T: Transport> {
     bearer: &'a dyn Bearer,
     user_agent: (&'static str, &'static str),
     pub page_cap: usize,
+    note: Option<&'a dyn Fn(String)>,
 }
 
 /// The scheme, host and port, lower-cased: the directory spells some hosts
@@ -151,6 +153,19 @@ impl<'a, T: Transport> Fhir<'a, T> {
             bearer,
             user_agent: ("mychart", env!("CARGO_PKG_VERSION")),
             page_cap: PAGE_CAP,
+            note: None,
+        }
+    }
+
+    /// Where a retry is reported, so a wait is never silent.
+    pub fn with_note(mut self, note: &'a dyn Fn(String)) -> Self {
+        self.note = Some(note);
+        self
+    }
+
+    fn tell(&self, line: String) {
+        if let Some(note) = self.note {
+            note(line)
         }
     }
 
@@ -173,13 +188,15 @@ impl<'a, T: Transport> Fhir<'a, T> {
         Ok(format!("{}/{}", self.base, path.trim_start_matches('/')))
     }
 
-    /// One GET with the token. A request that does not arrive, a 429 and a
-    /// 5xx are tried again, twice, within `Retry-After`: every request is a
-    /// read, so a repeat is harmless.
+    /// One GET with the token. Every request is a read, so a repeat is
+    /// harmless: a 429 or 5xx is tried again twice within `Retry-After`, and
+    /// a request that got no answer once (the transport's own timeout is a
+    /// minute, so a second wait is the most worth spending). Each retry is
+    /// reported through the note.
     pub fn get(&self, path: &str, accept: &str) -> Result<HttpResponse, CliError> {
         let url = self.url(path)?;
         pk_cli_core::transport::require_secure_url(&url)?;
-        let mut attempt = 0;
+        let (mut attempt, mut unanswered) = (0, 0);
         loop {
             let req = HttpRequest::get(url.clone())
                 .header("Accept", accept)
@@ -187,9 +204,10 @@ impl<'a, T: Transport> Fhir<'a, T> {
                 .user_agent(self.user_agent.0, self.user_agent.1);
             let resp = match block_on(self.t.send(req)) {
                 Ok(resp) => resp,
-                Err(e) if attempt < RETRIES && !e.is_auth() => {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_secs(attempt as u64));
+                Err(e) if unanswered < SEND_RETRIES && !e.is_auth() => {
+                    unanswered += 1;
+                    self.tell(format!("{}; trying once more", e.message()));
+                    std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -202,6 +220,12 @@ impl<'a, T: Transport> Fhir<'a, T> {
                     .map(Duration::from_secs)
                     .unwrap_or(Duration::from_secs(2 * attempt as u64))
                     .min(MAX_RETRY_WAIT);
+                self.tell(format!(
+                    "{} answered HTTP {}; trying again in {}s ({attempt}/{RETRIES})",
+                    origin(&url).unwrap_or_default(),
+                    resp.status,
+                    wait.as_secs()
+                ));
                 std::thread::sleep(wait);
                 continue;
             }
@@ -444,6 +468,121 @@ pub fn status_failure(resp: &HttpResponse) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Answers from a script, one per request, counting them.
+    struct Scripted(RefCell<Vec<Result<HttpResponse, CliError>>>, RefCell<usize>);
+
+    impl Transport for Scripted {
+        async fn send(&self, _: HttpRequest) -> Result<HttpResponse, CliError> {
+            *self.1.borrow_mut() += 1;
+            self.0.borrow_mut().remove(0)
+        }
+    }
+
+    struct Token;
+    impl Bearer for Token {
+        fn token(&self) -> Result<String, CliError> {
+            Ok("t".into())
+        }
+    }
+
+    fn ok(status: u16, body: &str) -> Result<HttpResponse, CliError> {
+        Ok(HttpResponse::new(status, body).header("retry-after", "0"))
+    }
+
+    fn unanswered() -> Result<HttpResponse, CliError> {
+        Err(CliError::Upstream(
+            "the request to https://fhir.example.org failed: operation timed out".into(),
+        ))
+    }
+
+    const PATIENT: &str = r#"{"resourceType":"Patient","id":"p1"}"#;
+
+    #[test]
+    fn a_request_without_an_answer_is_tried_once_more_and_said_so() {
+        let t = Scripted(
+            RefCell::new(vec![unanswered(), ok(200, PATIENT)]),
+            RefCell::new(0),
+        );
+        let notes = RefCell::new(Vec::new());
+        let note = |s: String| notes.borrow_mut().push(s);
+        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token).with_note(&note);
+        assert_eq!(fhir.read("Patient/p1").unwrap().id, "p1");
+        assert_eq!(*t.1.borrow(), 2);
+        assert_eq!(notes.borrow().len(), 1);
+        assert!(
+            notes.borrow()[0].contains("trying once more"),
+            "{:?}",
+            notes.borrow()
+        );
+
+        let t = Scripted(
+            RefCell::new(vec![unanswered(), unanswered()]),
+            RefCell::new(0),
+        );
+        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token);
+        assert!(matches!(fhir.read("Patient/p1"), Err(Failure::Fatal(_))));
+        assert_eq!(*t.1.borrow(), 2);
+    }
+
+    #[test]
+    fn a_busy_server_is_tried_twice_more_and_said_so() {
+        let t = Scripted(
+            RefCell::new(vec![ok(503, ""), ok(500, ""), ok(200, PATIENT)]),
+            RefCell::new(0),
+        );
+        let notes = RefCell::new(Vec::new());
+        let note = |s: String| notes.borrow_mut().push(s);
+        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token).with_note(&note);
+        assert!(fhir.read("Patient/p1").is_ok());
+        assert_eq!(*t.1.borrow(), 3);
+        assert_eq!(
+            *notes.borrow(),
+            [
+                "https://fhir.example.org answered HTTP 503; trying again in 0s (1/2)",
+                "https://fhir.example.org answered HTTP 500; trying again in 0s (2/2)",
+            ]
+        );
+
+        let t = Scripted(
+            RefCell::new(vec![ok(500, ""), ok(500, ""), ok(500, "")]),
+            RefCell::new(0),
+        );
+        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token);
+        assert!(matches!(
+            fhir.read("Patient/p1"),
+            Err(Failure::Skip {
+                code: "upstream",
+                ..
+            })
+        ));
+        assert_eq!(*t.1.borrow(), 3);
+    }
+
+    #[test]
+    fn a_maintenance_page_and_a_file_elsewhere_are_skips() {
+        let t = Scripted(
+            RefCell::new(vec![ok(200, "<html>down</html>")]),
+            RefCell::new(0),
+        );
+        let fhir = Fhir::new(&t, "https://fhir.example.org/R4", &Token);
+        assert!(matches!(
+            fhir.read("Patient/p1"),
+            Err(Failure::Skip {
+                code: "upstream",
+                ..
+            })
+        ));
+        assert!(matches!(
+            fhir.binary("https://elsewhere.example.org/R4/Binary/b1"),
+            Err(Failure::Skip {
+                code: "no_file",
+                ..
+            })
+        ));
+        assert_eq!(*t.1.borrow(), 1, "the file elsewhere was requested");
+    }
 
     #[test]
     fn minify_keeps_every_token_as_written() {

@@ -157,7 +157,8 @@ pub fn list(
     let c = ctx.signed_in(who)?;
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
     list_in(ctx, &fhir, &c.id, range)
 }
 
@@ -252,7 +253,8 @@ fn download_one(ctx: &Ctx, who: &PatientArgs, id: &str, output: &Path) -> Result
     let c = ctx.signed_in(who)?;
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
     let docs = list_in(ctx, &fhir, &c.id, &pk_cli_documents::RangeArgs::default())?;
     let Some(d) = docs.iter().find(|d| d.document.id == id) else {
         return Err(
@@ -284,7 +286,8 @@ fn download_all(
     let c = ctx.signed_in(who)?;
     let t = transport()?;
     let live = Live::start(&t, ctx.vault.as_ref(), &ctx.lock, &c)?;
-    let fhir = Fhir::new(&t, &live.fhir_base(), &live);
+    let tell = |line: String| ctx.note(line);
+    let fhir = Fhir::new(&t, &live.fhir_base(), &live).with_note(&tell);
     let docs = list_in(ctx, &fhir, &c.id, range)?;
     crate::fsutil::create_private_dir(dir)?;
     let (mut saved, mut skipped) = (Vec::new(), Vec::new());

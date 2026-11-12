@@ -663,7 +663,8 @@ fn an_export_goes_past_files_elsewhere_and_answers_that_are_not_fhir() {
     assert_eq!(trailer["counts"]["DocumentReference"], 2);
     assert_eq!(trailer["counts"]["Organization"], 1);
     assert!(trailer["counts"].get("Goal").is_none());
-    // The token never went to the other server: the mock saw every request.
+    // Nor was the file fetched from this server under its id, as a path
+    // rewritten onto the base would have been.
     assert_eq!(mock.get(|st| st.hits.get("Binary/bin-far").copied()), None);
 }
 
