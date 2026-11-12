@@ -10,7 +10,6 @@ use std::io::Write;
 
 use pk_cli_core::CliError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::fhir::{RawResource, MAX_LINE_BYTES};
 
@@ -27,8 +26,13 @@ pub struct Header {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
     pub pulled_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fhir_version: Option<String>,
+    /// Always written; a reader takes an absent one as 4.0.1.
+    #[serde(default = "default_fhir_version")]
+    pub fhir_version: String,
+}
+
+fn default_fhir_version() -> String {
+    FHIR_VERSION.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +59,13 @@ pub struct StreamPatient {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<String>,
+    /// `patient`: mychart reads providers, never insurers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The signed-in user's `fhirUser` (`Patient/…`, or `RelatedPerson/…`
+    /// for a parent's proxy access).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fhir_user: Option<String>,
 }
 
 /// One thing the export could not carry, and why.
@@ -80,7 +91,27 @@ pub struct Trailer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<Value>,
+    pub error: Option<TrailerError>,
+}
+
+/// Why a stream stopped: piekstra-cli/1's error code and the exit code the
+/// CLI ended with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrailerError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+impl TrailerError {
+    pub fn from_error(e: &CliError) -> Self {
+        TrailerError {
+            code: e.code().into(),
+            message: e.message().to_string(),
+            exit_code: Some(e.exit_code()),
+        }
+    }
 }
 
 pub struct RecordsWriter<W: Write> {
@@ -159,13 +190,7 @@ impl<W: Write> RecordsWriter<W> {
             counts: std::mem::take(&mut self.counts),
             skipped: std::mem::take(&mut self.skipped),
             finished_at: Some(finished_at),
-            error: error.map(|e| {
-                serde_json::json!({
-                    "code": error_code(e),
-                    "message": e.message(),
-                    "exit_code": e.exit_code(),
-                })
-            }),
+            error: error.map(TrailerError::from_error),
         };
         let line = serde_json::to_string(&trailer).map_err(|e| CliError::Other(e.to_string()))?;
         writeln!(self.out, "{line}").map_err(io)?;
@@ -174,19 +199,10 @@ impl<W: Write> RecordsWriter<W> {
     }
 }
 
-fn error_code(e: &CliError) -> &'static str {
-    match e.exit_code() {
-        2 => "usage",
-        3 => "auth",
-        4 => "not_found",
-        5 => "upstream",
-        _ => "other",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn header() -> Header {
         Header {
@@ -206,10 +222,12 @@ mod tests {
                 organization: Some("1000-1".into()),
                 label: None,
                 relationship: Some("self".into()),
+                kind: Some("patient".into()),
+                fhir_user: None,
             },
             since: None,
             pulled_at: "2026-01-01T00:00:00Z".into(),
-            fhir_version: Some(FHIR_VERSION.into()),
+            fhir_version: FHIR_VERSION.into(),
         }
     }
 
@@ -263,5 +281,27 @@ mod tests {
         assert_eq!(trailer["complete"], false);
         assert_eq!(trailer["error"]["code"], "auth");
         assert_eq!(trailer["error"]["exit_code"], 3);
+    }
+
+    #[test]
+    fn a_keychain_failure_keeps_its_own_code() {
+        let mut buf = Vec::new();
+        let w = RecordsWriter::new(&mut buf, &header()).unwrap();
+        let e = CliError::Keychain("the Keychain refused the read".into());
+        w.finish("2026-01-01T00:01:00Z".into(), Some(&e)).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let trailer: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(trailer["error"]["code"], "keychain");
+        assert_eq!(trailer["error"]["exit_code"], e.exit_code());
+    }
+
+    #[test]
+    fn a_header_without_fhir_version_reads_as_4_0_1() {
+        let line = serde_json::to_string(&header()).unwrap();
+        assert!(line.contains(r#""fhir_version":"4.0.1""#), "{line}");
+        let mut v: Value = serde_json::from_str(&line).unwrap();
+        v.as_object_mut().unwrap().remove("fhir_version");
+        let back: Header = serde_json::from_value(v).unwrap();
+        assert_eq!(back.fhir_version, FHIR_VERSION);
     }
 }

@@ -30,7 +30,12 @@ pub fn synthetic(c: &Context) -> bool {
         })
 }
 
-fn validate(args: &ExportArgs) -> Result<(), CliError> {
+fn validate(args: &ExportArgs, json: bool) -> Result<(), CliError> {
+    if args.ndjson && json {
+        return Err(CliError::Usage(
+            "--ndjson is the output; leave out --json (it is for -o <DIR>, which prints records-export/v1)".into(),
+        ));
+    }
     if let Some(d) = &args.since {
         pk_cli_core::dates::parse_iso(d)?;
     }
@@ -60,15 +65,17 @@ pub fn header(c: &Context, since: Option<&str>) -> Header {
             organization: Some(c.organization.clone()),
             label: c.label.clone(),
             relationship: c.relationship.clone(),
+            kind: Some("patient".into()),
+            fhir_user: c.fhir_user.clone(),
         },
         since: since.map(str::to_string),
         pulled_at: rfc3339(now()),
-        fhir_version: Some(FHIR_VERSION.into()),
+        fhir_version: FHIR_VERSION.into(),
     }
 }
 
 fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
-    validate(args)?;
+    validate(args, ctx.json())?;
     let c = ctx.signed_in(&args.who)?;
     if args.output.is_some() && !synthetic(&c) {
         return Err(CliError::Usage(format!(
@@ -121,13 +128,16 @@ fn export_cmd(ctx: &Ctx, args: &ExportArgs) -> Result<(), CliError> {
             let result = export::run(&fhir, &mut w, &c.id, since, &note);
             let trailer = w.finish(rfc3339(now()), result.as_ref().err())?;
             crate::fsutil::write_private(&path, &buf)?;
-            let payload = json!({
+            let mut payload = json!({
                 "schema": "records-export/v1",
                 "path": path.display().to_string(),
-                "counts": trailer.counts,
-                "skipped": trailer.skipped,
+                "bytes": buf.len() as u64,
                 "complete": trailer.complete,
+                "counts": trailer.counts,
             });
+            if !trailer.skipped.is_empty() {
+                payload["skipped"] = json!(trailer.skipped);
+            }
             if ctx.json() {
                 output::json(&payload);
             } else {
