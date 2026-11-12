@@ -38,8 +38,9 @@ pub fn get_json<T: DeserializeOwned>(v: &dyn Vault, account: &str) -> Result<Opt
         None => Ok(None),
         Some(s) => serde_json::from_str(&s).map(Some).map_err(|e| {
             CliError::Keychain(format!(
-                "the Keychain item {account} in {} is not a sign-in this version can read ({e})",
-                v.service()
+                "the Keychain item {account} in {} is not a sign-in this version can read (it {})",
+                v.service(),
+                crate::fhir::describe_json_error(&e)
             ))
             .with_remedy("sign in again with `mychart auth login`; the new sign-in replaces it")
         }),

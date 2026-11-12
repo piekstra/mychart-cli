@@ -41,7 +41,8 @@ impl RawResource {
         }
         let head: Head = serde_json::from_str(raw).map_err(|e| {
             CliError::Upstream(format!(
-                "the organization sent a resource that is not FHIR JSON: {e}"
+                "the organization sent a resource that {}",
+                describe_json_error(&e)
             ))
         })?;
         Ok(RawResource {
@@ -79,6 +80,20 @@ pub fn minify(json: &str) -> String {
         }
     }
     out
+}
+
+/// A serde_json error without the value it stopped at (serde quotes one:
+/// ``invalid type: integer `12345` ``), so no record's content reaches an
+/// error, a skip reason or a log: what went wrong, and where.
+pub fn describe_json_error(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let what = match e.classify() {
+        Category::Io => "could not be read",
+        Category::Syntax => "is not valid JSON",
+        Category::Data => "does not have the expected shape",
+        Category::Eof => "ends early",
+    };
+    format!("{what} (line {}, column {})", e.line(), e.column())
 }
 
 /// Supplies the bearer token, renewing it when it is due.
@@ -315,7 +330,10 @@ impl<'a, T: Transport> Fhir<'a, T> {
             summary.pages += 1;
             let page: Page = serde_json::from_str(&resp.body).map_err(|e| Failure::Skip {
                 code: "upstream",
-                reason: format!("the search result is not a FHIR Bundle: {e}"),
+                reason: format!(
+                    "the search result is not a FHIR Bundle: it {}",
+                    describe_json_error(&e)
+                ),
             })?;
             if page.resource_type != "Bundle" {
                 return Err(Failure::Skip {
@@ -558,6 +576,23 @@ mod tests {
             })
         ));
         assert_eq!(*t.1.borrow(), 3);
+    }
+
+    #[test]
+    fn a_parse_error_never_quotes_the_value() {
+        for body in [
+            r#"{"resourceType":"Patient","id":12345}"#,
+            r#"{"resourceType":"Patient","id":true}"#,
+            r#"{"resourceType":"Patient","id":"pat-0001""#,
+            "<html>Sam Example</html>",
+        ] {
+            let e = RawResource::parse(body).unwrap_err();
+            let text = e.to_string();
+            for secret in ["12345", "true", "pat-0001", "Sam", "Example"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+            assert!(text.contains("line 1"), "{text}");
+        }
     }
 
     #[test]

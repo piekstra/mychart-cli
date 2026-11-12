@@ -1,9 +1,14 @@
-//! Owner-only files, through the family's one writer
-//! (`pk_cli_drive::private_file`): a temp file beside the target, created
-//! exclusively (`O_EXCL`) with mode `0600` and renamed over it. A reader
-//! never sees half a file, nobody else on the machine can read it, and a
-//! file or symbolic link planted at the temp name or the target never
-//! receives the bytes (a planted temp name makes the write fail instead).
+//! Owner-only files, written whole: a temp file beside the target, created
+//! exclusively (`O_EXCL`) with mode `0600` by the family's writer
+//! (`pk_cli_drive::private_file`), synced to disk, then renamed over the
+//! target. A reader never sees half a file, even after a crash; nobody else
+//! on the machine can read it; a file or symbolic link planted at the temp
+//! name or the target never receives the bytes (a planted temp name makes
+//! the write fail instead).
+//!
+//! The sync is here because `private_file::write` (cli-common v0.29.0)
+//! renames without one; once a pinned cli-common syncs, this is
+//! `private_file::write(path, bytes, Replace::Always)`.
 
 use std::path::Path;
 
@@ -11,13 +16,31 @@ use pk_cli_core::CliError;
 use pk_cli_drive::private_file::{self, Replace};
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    let fail =
+        |what: &str, e: std::io::Error| CliError::Other(format!("{what} {}: {e}", path.display()));
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     create_private_dir(dir)?;
-    private_file::write(path, bytes, Replace::Always)
-        .map_err(|e| CliError::Other(format!("writing {}: {e}", path.display())))
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    private_file::write(&tmp, bytes, Replace::Never).map_err(|e| fail("writing", e))?;
+    let result = std::fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| fail("writing", e))
+        .and_then(|()| std::fs::rename(&tmp, path).map_err(|e| fail("replacing", e)));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Create `dir` (and parents) owner-only.

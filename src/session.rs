@@ -131,7 +131,13 @@ impl Index {
         match std::fs::read_to_string(&self.path) {
             Ok(s) => serde_json::from_str::<IndexFile>(&s)
                 .map(|f| f.contexts)
-                .map_err(|e| CliError::Other(format!("parsing {}: {e}", self.path.display()))),
+                .map_err(|e| {
+                    CliError::Other(format!(
+                        "{} {}",
+                        self.path.display(),
+                        crate::fhir::describe_json_error(&e)
+                    ))
+                }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(CliError::Other(format!(
                 "reading {}: {e}",
