@@ -15,5 +15,4 @@ pub mod oauth;
 pub mod orgs;
 pub mod session;
 pub mod smart;
-pub mod stream;
 pub mod vault;

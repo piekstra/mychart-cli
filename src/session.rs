@@ -97,6 +97,34 @@ impl Context {
         account(&self.organization, &self.id)
     }
 
+    /// The profile's `PatientContext`, as the stream header carries it: no
+    /// Keychain account (that is this machine's), no name (never read).
+    pub fn patient_context(&self) -> pk_med_records::PatientContext {
+        pk_med_records::PatientContext {
+            id: self.id.clone(),
+            organization: self.organization.clone(),
+            label: self.label.clone(),
+            relationship: self.relationship.clone(),
+            kind: Some("patient".into()),
+            member_role: None,
+            fhir_user: self.fhir_user.clone(),
+            name: None,
+            session: None,
+        }
+    }
+
+    /// The profile's `Organization` for the stream header.
+    pub fn organization_dto(&self) -> pk_med_records::Organization {
+        pk_med_records::Organization {
+            id: self.organization.clone(),
+            name: self.organization_name.clone(),
+            fhir_base: self.fhir_base.clone(),
+            vendor: Some(crate::orgs::VENDOR.into()),
+            location: None,
+            aliases: Vec::new(),
+        }
+    }
+
     /// What a `--patient` reference may match: the FHIR id, the label, and
     /// `<label>@<org>` style names come from `display`.
     pub fn display(&self) -> String {

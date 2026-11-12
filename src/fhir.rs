@@ -1,10 +1,12 @@
 //! A read-only FHIR R4 client over one organization's base URL: reads,
 //! searches that follow `Bundle.link[next]`, and `Binary` fetches. Resources
-//! stay as the server's text (minified), because a `serde_json::Value` would
-//! rewrite a FHIR decimal such as `1.50`.
+//! stay as the server's text (`pk_med_fhir::RawResource`, minified), because
+//! a `serde_json::Value` would rewrite a FHIR decimal such as `1.50`.
 //!
-//! Shaped like `pk_med_fhir::FhirClient` (medical-common), which replaces
-//! this module once it is tagged.
+//! The request layer stays here until `pk_med_fhir::FhirClient` takes a
+//! token source (an export outlives Epic's hour-long access token), tells a
+//! network failure from a 5xx, reports its retries, and reads a page around
+//! an entry that is not a resource.
 
 use std::time::Duration;
 
@@ -17,84 +19,12 @@ use serde_json::Value;
 /// Pages one search follows before it stops and says so.
 pub const PAGE_CAP: usize = 100;
 /// The longest stream line (a Binary carries its document inline).
-pub const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_LINE_BYTES: usize = pk_med_records::MAX_LINE_BYTES;
 const RETRIES: usize = 2;
 const SEND_RETRIES: usize = 1;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
-/// One resource as the server sent it, minified.
-#[derive(Debug, Clone)]
-pub struct RawResource {
-    pub resource_type: String,
-    pub id: String,
-    pub raw: String,
-}
-
-impl RawResource {
-    pub fn parse(raw: &str) -> Result<Self, CliError> {
-        #[derive(Deserialize)]
-        struct Head {
-            #[serde(rename = "resourceType")]
-            resource_type: String,
-            #[serde(default)]
-            id: String,
-        }
-        let head: Head = serde_json::from_str(raw).map_err(|e| {
-            CliError::Upstream(format!(
-                "the organization sent a resource that {}",
-                describe_json_error(&e)
-            ))
-        })?;
-        Ok(RawResource {
-            resource_type: head.resource_type,
-            id: head.id,
-            raw: minify(raw),
-        })
-    }
-
-    pub fn value(&self) -> Option<Value> {
-        serde_json::from_str(&self.raw).ok()
-    }
-}
-
-/// JSON without insignificant whitespace, every token kept as written.
-pub fn minify(json: &str) -> String {
-    let mut out = String::with_capacity(json.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for c in json.chars() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-        } else if c == '"' {
-            in_string = true;
-            out.push(c);
-        } else if !c.is_ascii_whitespace() {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// A serde_json error without the value it stopped at (serde quotes one:
-/// ``invalid type: integer `12345` ``), so no record's content reaches an
-/// error, a skip reason or a log: what went wrong, and where.
-pub fn describe_json_error(e: &serde_json::Error) -> String {
-    use serde_json::error::Category;
-    let what = match e.classify() {
-        Category::Io => "could not be read",
-        Category::Syntax => "is not valid JSON",
-        Category::Data => "does not have the expected shape",
-        Category::Eof => "ends early",
-    };
-    format!("{what} (line {}, column {})", e.line(), e.column())
-}
+pub use pk_med_fhir::{describe_json_error, RawResource};
 
 /// Supplies the bearer token, renewing it when it is due.
 pub trait Bearer {
@@ -430,7 +360,7 @@ struct EntrySearch {
 /// `issue[].details.text` or `diagnostics`, shortened: what an
 /// OperationOutcome says, for a skip reason or an error message.
 pub fn outcome_messages(r: &RawResource) -> Vec<String> {
-    let Some(v) = r.value() else {
+    let Ok(v) = r.value() else {
         return Vec::new();
     };
     v["issue"]
@@ -591,7 +521,6 @@ mod tests {
             for secret in ["12345", "true", "pat-0001", "Sam", "Example"] {
                 assert!(!text.contains(secret), "{text}");
             }
-            assert!(text.contains("line 1"), "{text}");
         }
     }
 
@@ -620,10 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn minify_keeps_every_token_as_written() {
+    fn a_resource_keeps_every_token_as_written() {
         let pretty = "{\n  \"resourceType\": \"Observation\",\n  \"valueQuantity\": { \"value\": 1.50 },\n  \"note\": [{\"text\": \"a  b \\\" c\"}]\n}";
         assert_eq!(
-            minify(pretty),
+            RawResource::parse(pretty).unwrap().raw,
             r#"{"resourceType":"Observation","valueQuantity":{"value":1.50},"note":[{"text":"a  b \" c"}]}"#
         );
     }

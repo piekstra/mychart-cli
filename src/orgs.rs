@@ -35,6 +35,9 @@ pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const INDEX_SCHEMA: &str = "mychart-org-index/1";
 const BRAND_ID_SYSTEM: &str = "https://open.epic.com/brand-identifier";
 
+/// `Organization.vendor` for every organization mychart reaches.
+pub const VENDOR: &str = "epic";
+
 /// One reachable organization: a primary brand and its endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Org {
@@ -90,19 +93,26 @@ impl Org {
     }
 
     /// The profile's `Organization` DTO (org-list/v1 items).
+    /// The profile's `Organization` (`org-list/v1`, the stream header's).
+    pub fn organization(&self) -> pk_med_records::Organization {
+        pk_med_records::Organization {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            fhir_base: self.fhir_base.clone(),
+            vendor: Some(VENDOR.into()),
+            location: (!self.states.is_empty()).then(|| self.states.join(", ")),
+            aliases: if self.uuid.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.uuid.clone()]
+            },
+        }
+    }
+
+    /// `organization()` and, from a search, what matched.
     pub fn dto(&self, matched: Option<&str>) -> serde_json::Value {
-        let mut v = serde_json::json!({
-            "id": self.id,
-            "name": self.name,
-            "fhir_base": self.fhir_base,
-            "vendor": "epic",
-        });
-        if !self.states.is_empty() {
-            v["location"] = self.states.join(", ").into();
-        }
-        if !self.uuid.is_empty() {
-            v["aliases"] = serde_json::json!([self.uuid]);
-        }
+        // Strings, optional strings and a list of them: nothing to fail on.
+        let mut v = serde_json::to_value(self.organization()).expect("an Organization serializes");
         if let Some(m) = matched {
             v["matched"] = m.into();
         }
@@ -224,23 +234,10 @@ struct ManagingOrganization {
 }
 
 /// A FHIR base for joining paths and for the profile's `fhir_base`: scheme
-/// and host lower case, trailing slashes removed, the path untouched (as
-/// `pk_med_fhir::normalize_base`). The directory spells some hosts in
-/// capitals (`FHIR.KP.ORG`); its untouched spelling is `Org::address`, the
-/// `aud`.
-pub fn normalize_base(url: &str) -> String {
-    let url = url.trim().trim_end_matches('/');
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(split);
-    format!(
-        "{}://{}{path}",
-        scheme.to_ascii_lowercase(),
-        authority.to_ascii_lowercase()
-    )
-}
+/// and host lower case, trailing slashes removed, the path untouched. The
+/// directory spells some hosts in capitals (`FHIR.KP.ORG`); its untouched
+/// spelling is `Org::address`, the `aud`.
+pub use pk_med_fhir::normalize_base;
 
 /// Build the index from the bundle's text.
 pub fn parse_brands(text: &str) -> Result<(Vec<Org>, Option<String>), CliError> {

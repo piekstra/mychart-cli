@@ -176,7 +176,7 @@ fn list_in<T: pk_cli_core::transport::Transport>(
         params.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let r = fhir.search_each("DocumentReference", &params, |r| {
             if seen.insert(r.id.clone()) {
-                if let Some(v) = r.value() {
+                if let Ok(v) = r.value() {
                     out.extend(documents_of(&v));
                 }
             }
@@ -310,7 +310,7 @@ fn download_all(
     }
     let batch = DownloadBatch::new(dir.display().to_string(), saved).with_skipped(skipped);
     if ctx.json() {
-        output::json(&serde_json::to_value(&batch).unwrap_or_default());
+        output::json(&super::to_json(&batch)?);
     } else {
         println!(
             "saved {} documents to {} ({} skipped)",

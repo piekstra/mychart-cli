@@ -233,6 +233,14 @@ range requests, so a failed download starts over.
   which can differ in case from the directory's; mychart compares origins
   without case and follows no link to another host. An attachment URL on
   another host is a `no_file` skip; the token is not sent there.
+- **`--since`** adds `date=ge<D>` only to the searches whose type Epic
+  documents a `date` parameter for: Observation, DiagnosticReport,
+  DocumentReference, Encounter, Immunization and Procedure. mychart adds no
+  `_lastUpdated`, which a server that does not support it can answer with a
+  400 for the whole search. The Patient, the other searches and the reads by
+  reference are not bounded; the stream header names their types in
+  `since_unbounded`, so a reader knows they may hold older resources. A
+  `Binary` comes only from a dated `DocumentReference` or `DiagnosticReport`.
 - **Transient failures**: mychart tries a request again twice when it
   answers 429, 500, 502, 503 or 504, waiting `Retry-After` (at most 30
   seconds), and once when it gets no answer (the transport waits a minute

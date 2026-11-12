@@ -20,7 +20,7 @@ pub fn run(ctx: &Ctx, cmd: &ConfigCmd) -> Result<(), CliError> {
         }
         ConfigCmd::Show => {
             let cfg: Config = ctx.config()?;
-            let v = serde_json::to_value(&cfg).unwrap_or_default();
+            let v = super::to_json(&cfg)?;
             if ctx.json() {
                 output::json(&output::tagged("config", v));
             } else if v.as_object().is_some_and(|o| o.is_empty()) {
